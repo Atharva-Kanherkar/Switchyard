@@ -94,6 +94,14 @@ impl TranslatingLlmClient {
     /// Builds a client over the given [`ModelConfig`]s, with a fresh shared HTTP
     /// client and the built-in translation codecs.
     pub fn new(model_configs: &[ModelConfig]) -> Result<Self> {
+        for config in model_configs {
+            config
+                .default_backend
+                .validate_extra_headers(&config.model_name)?;
+            for backend in config.other_backends.iter().flatten() {
+                backend.validate_extra_headers(&config.model_name)?;
+            }
+        }
         let client =
             reqwest::Client::builder()
                 .build()
@@ -954,6 +962,30 @@ mod tests {
             ..Default::default()
         });
         request
+    }
+
+    #[test]
+    fn client_rejects_reserved_headers_on_alternate_backends() {
+        for header in ["Authorization", "X-Api-Key", "ANTHROPIC-VERSION"] {
+            let mut alternate = config("https://example.test");
+            alternate
+                .extra_headers
+                .insert(header.to_string(), "injected".to_string());
+            let models = [ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(config("https://example.test/v1")),
+                Some(vec![Backend::Anthropic(alternate)]),
+            )];
+
+            let Err(error) = TranslatingLlmClient::new(&models) else {
+                panic!("expected {header} to be rejected");
+            };
+            assert!(matches!(
+                error,
+                LlmClientError::Configuration { message }
+                    if message.contains(&format!("reserved header {header:?}"))
+            ));
+        }
     }
 
     #[tokio::test]
