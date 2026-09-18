@@ -137,6 +137,8 @@ fn decode_openai_chat_stream(
             if let Some(text) = delta.get("refusal").and_then(Value::as_str)
                 && !text.is_empty()
             {
+                // Refusal deltas mark the whole message as a content-filter stop. This state
+                // persists across chunks so a later `finish_reason: "stop"` cannot overwrite it.
                 state.stop_reason = Some("content_filter".to_string());
                 out.push(LlmResponseChunk::TextDelta {
                     index: 0,
