@@ -1503,6 +1503,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_conversation_continuation_materializes_for_anthropic() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("request JSON");
+                let text = body.to_string();
+                let id = if text.contains("thanks question") {
+                    "msg_third"
+                } else if text.contains("recall question") {
+                    "msg_follow"
+                } else {
+                    "msg_seed"
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": id, "type": "message", "role": "assistant", "model": "weak",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let client: Arc<dyn RoutedLlmClient> = Arc::new(
+            TranslatingLlmClient::new(&[ModelConfig::new(
+                "weak",
+                Backend::Anthropic(HttpBackendConfig {
+                    base_url: server.uri(),
+                    api_key: None,
+                    forward_auth: false,
+                    extra_headers: BTreeMap::new(),
+                    extra_body: BTreeMap::new(),
+                    reasoning_effort: None,
+                    max_retries: 0,
+                    timeout: None,
+                }),
+                None,
+            )])
+            .map_err(|error| LibsyError::external("building test client", error))?,
+        );
+        let clients = ClientRouter::new(HashMap::from([(ModelId::from("weak"), client)]));
+        let models = to_category_map(&["weak"]);
+
+        let request = |input: &str| {
+            let llm_request = switchyard_translation::decode_request(
+                WireFormat::OpenAiResponses,
+                &json!({
+                    "model": "route",
+                    "input": input,
+                    "conversation": "conv_081",
+                    "store": true
+                }),
+            )
+            .map_err(|error| LibsyError::external("decoding request", error));
+            Ok::<Request, LibsyError>(Request {
+                llm_request: llm_request?,
+                raw_request: None,
+                metadata: None,
+            })
+        };
+
+        let (_, response) = run(
+            Arc::new(switchyard_libsy::Passthrough),
+            clients.clone(),
+            request("seed question")?,
+            models.clone(),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            response
+                .llm_response
+                .as_agg()
+                .and_then(|agg| agg.id.as_deref()),
+            Some("msg_seed")
+        );
+
+        let (_, response) = run(
+            Arc::new(switchyard_libsy::Passthrough),
+            clients.clone(),
+            request("recall question")?,
+            models.clone(),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            completion_text(
+                response
+                    .llm_response
+                    .as_agg()
+                    .expect("buffered follow-up response")
+            ),
+            "ok"
+        );
+
+        let (_, response) = run(
+            Arc::new(switchyard_libsy::Passthrough),
+            clients,
+            request("thanks question")?,
+            models,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            completion_text(
+                response
+                    .llm_response
+                    .as_agg()
+                    .expect("buffered chained response")
+            ),
+            "ok"
+        );
+
+        let requests = server.received_requests().await.expect("request recording");
+        assert_eq!(requests.len(), 3);
+        let seed = String::from_utf8_lossy(&requests[0].body);
+        assert!(seed.contains("seed question"));
+        assert!(!seed.contains("recall question"));
+        let follow = String::from_utf8_lossy(&requests[1].body);
+        assert!(follow.contains("seed question"));
+        assert!(follow.contains("recall question"));
+        let third = String::from_utf8_lossy(&requests[2].body);
+        assert!(third.contains("recall question"));
+        assert!(third.contains("thanks question"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn streamed_cross_format_state_is_recorded_only_after_completion() -> Result<()> {
         let client = Arc::new(CandidateClient {
             calls: Mutex::new(Vec::new()),
@@ -1575,6 +1703,76 @@ mod tests {
         assert!(matches!(
             outcome.request.llm_request.messages[2].content.as_slice(),
             [ContentBlock::ToolResult(result)] if result.tool_call_id == "toolu_stream"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_cross_format_conversation_state_is_recorded_after_completion() -> Result<()> {
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let clients = ClientRouter::new(HashMap::from([(
+            ModelId::from("weak"),
+            client as Arc<dyn RoutedLlmClient>,
+        )]));
+        let mut seed = request();
+        seed.llm_request.messages = vec![Message::text(Role::User, "seed question")];
+        seed.llm_request
+            .extensions
+            .fields
+            .insert("conversation".to_string(), json!("conv_stream"));
+        let mut response = stream_response(vec![
+            LlmResponseChunk::MessageStart {
+                id: Some("msg_stream".to_string()),
+                model: Some("weak".to_string()),
+            },
+            LlmResponseChunk::TextDelta {
+                index: 0,
+                text: "streamed".to_string(),
+            },
+            LlmResponseChunk::MessageStop {
+                reason: Some("stop".to_string()),
+            },
+        ]);
+        response.set_served_model(&ModelId::from("weak"));
+        let response = clients.remember_state_owner(&seed, response)?;
+
+        let mut follow = request();
+        follow
+            .llm_request
+            .extensions
+            .fields
+            .insert("conversation".to_string(), json!("conv_stream"));
+        follow.llm_request.messages = vec![Message::text(Role::User, "recall question")];
+        assert!(clients.stored_state_owner(&follow).is_none());
+        response
+            .llm_response
+            .into_agg()
+            .await
+            .map_err(|error| LibsyError::client_call("weak", error))?;
+
+        let outcome = continue_on(
+            clients
+                .stored_state_owner(&follow)
+                .expect("completed conversation stream state"),
+            "passthrough",
+            follow,
+        );
+        assert_eq!(outcome.request.llm_request.messages.len(), 3);
+        assert!(matches!(
+            outcome.request.llm_request.messages[0].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "seed question"
+        ));
+        assert!(matches!(
+            outcome.request.llm_request.messages[1].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "streamed"
+        ));
+        assert!(matches!(
+            outcome.request.llm_request.messages[2].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "recall question"
         ));
         Ok(())
     }
@@ -1718,6 +1916,46 @@ mod tests {
             Some(&model)
         );
         assert_eq!(owners.by_id.len(), MAX_STATE_OWNERS);
+        Ok(())
+    }
+
+    #[test]
+    fn materialized_conversation_state_keeps_latest_history() -> std::result::Result<(), LlmClientError> {
+        let mut owners = StateOwners::default();
+        let model = ModelId::from("model/a");
+        let first = Arc::new(MessageHistory::new(
+            None,
+            Arc::from(vec![Message::text(Role::User, "seed question")]),
+        ));
+        let second = Arc::new(MessageHistory::new(
+            None,
+            Arc::from(vec![Message::text(Role::User, "recall question")]),
+        ));
+        owners.remember(Some("resp_1"), Some("conv_1"), &model, Some(first))?;
+        owners.remember(Some("resp_2"), Some("conv_1"), &model, Some(second))?;
+        let latest = owners
+            .owner("conv_1")
+            .and_then(|state| state.history.clone())
+            .expect("materialized conversation state");
+        assert!(matches!(
+            latest.segment.as_ref(),
+            [Message { content, .. }] if matches!(
+                content.as_slice(),
+                [ContentBlock::Text { text }] if text == "recall question"
+            )
+        ));
+        owners.remember(Some("resp_3"), Some("conv_1"), &model, None)?;
+        let kept = owners
+            .owner("conv_1")
+            .and_then(|state| state.history.clone())
+            .expect("conversation state survived a provider-owned record");
+        assert!(matches!(
+            kept.segment.as_ref(),
+            [Message { content, .. }] if matches!(
+                content.as_slice(),
+                [ContentBlock::Text { text }] if text == "recall question"
+            )
+        ));
         Ok(())
     }
 
