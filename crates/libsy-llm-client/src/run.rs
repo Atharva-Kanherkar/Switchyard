@@ -868,11 +868,12 @@ impl ClientRouter {
             input.parent.clone(),
             Arc::from(segment),
         ));
-        let result = self
-            .inner
-            .state_owners
-            .lock()
-            .remember(response_id, conversation, model, Some(history));
+        let result = self.inner.state_owners.lock().remember(
+            response_id,
+            conversation,
+            model,
+            Some(history),
+        );
         if let Err(error) = result {
             if matches!(error, LlmClientError::ResponseStateLimitExceeded { .. }) {
                 tracing::warn!(%error, "cross-format Responses state capacity reached; history was not retained");
@@ -1920,7 +1921,8 @@ mod tests {
     }
 
     #[test]
-    fn materialized_conversation_state_keeps_latest_history() -> std::result::Result<(), LlmClientError> {
+    fn materialized_conversation_state_keeps_latest_history()
+    -> std::result::Result<(), LlmClientError> {
         let mut owners = StateOwners::default();
         let model = ModelId::from("model/a");
         let first = Arc::new(MessageHistory::new(
