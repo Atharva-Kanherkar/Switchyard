@@ -518,7 +518,11 @@ impl StateOwners {
             }
         }
         if let Some(id) = conversation_id {
-            self.by_id.entry(id.to_owned()).or_insert(state);
+            if materialized {
+                self.by_id.insert(id.to_owned(), state);
+            } else {
+                self.by_id.entry(id.to_owned()).or_insert(state);
+            }
         }
         Ok(())
     }
@@ -719,8 +723,14 @@ impl ClientRouter {
                             .map_err(|error| LibsyError::client_call(model.clone(), error))?;
                     }
                 } else if let Some(input) = &canonical_input {
-                    self.remember_canonical_response(&agg, &model, store, input)
-                        .map_err(|error| LibsyError::client_call(model.clone(), error))?;
+                    self.remember_canonical_response(
+                        &agg,
+                        &model,
+                        store,
+                        conversation.as_deref(),
+                        input,
+                    )
+                    .map_err(|error| LibsyError::client_call(model.clone(), error))?;
                 }
                 LlmResponse::Agg(agg)
             }
@@ -756,6 +766,7 @@ impl ClientRouter {
                                     &accumulator.finish(),
                                     &model,
                                     store,
+                                    conversation.as_deref(),
                                     input,
                                 )?;
                             }
@@ -841,6 +852,7 @@ impl ClientRouter {
         response: &AggLlmResponse,
         model: &ModelId,
         store: bool,
+        conversation: Option<&str>,
         input: &CanonicalInput,
     ) -> std::result::Result<(), LlmClientError> {
         let response_id = response.id.as_deref().filter(|_| store);
@@ -856,11 +868,11 @@ impl ClientRouter {
             input.parent.clone(),
             Arc::from(segment),
         ));
-        let result =
-            self.inner
-                .state_owners
-                .lock()
-                .remember(response_id, None, model, Some(history));
+        let result = self
+            .inner
+            .state_owners
+            .lock()
+            .remember(response_id, conversation, model, Some(history));
         if let Err(error) = result {
             if matches!(error, LlmClientError::ResponseStateLimitExceeded { .. }) {
                 tracing::warn!(%error, "cross-format Responses state capacity reached; history was not retained");
