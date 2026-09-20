@@ -677,12 +677,11 @@ impl ClientRouter {
     }
 
     fn canonical_input(&self, request: &Request) -> CanonicalInput {
-        let parent = request
-            .llm_request
-            .extensions
-            .fields
+        let fields = &request.llm_request.extensions.fields;
+        let parent = fields
             .get("previous_response_id")
             .and_then(Value::as_str)
+            .or_else(|| conversation_id(fields))
             .and_then(|id| self.inner.state_owners.lock().owner(id)?.history.clone());
         let parent_len = parent.as_ref().map_or(0, |history| history.len);
         let (parent, messages) = match request.llm_request.messages.get(parent_len..) {
@@ -856,7 +855,8 @@ impl ClientRouter {
         input: &CanonicalInput,
     ) -> std::result::Result<(), LlmClientError> {
         let response_id = response.id.as_deref().filter(|_| store);
-        if response_id.is_none() {
+        // `store: false` disables response-ID lookup, not conversation history.
+        if response_id.is_none() && conversation.is_none() {
             return Ok(());
         }
         let mut segment = input.messages.to_vec();
@@ -1298,6 +1298,22 @@ mod tests {
 
     #[tokio::test]
     async fn responses_stored_tool_continuation_materializes_for_anthropic() -> Result<()> {
+        for (field, conversation, store) in [
+            ("previous_response_id", Value::Null, true),
+            ("conversation", json!("conv_tools"), true),
+            ("conversation", json!({"id": "conv_tools"}), true),
+            ("conversation", json!("conv_tools"), false),
+        ] {
+            check_stored_tool_continuation(field, conversation, store).await?;
+        }
+        Ok(())
+    }
+
+    async fn check_stored_tool_continuation(
+        field: &str,
+        conversation: Value,
+        store: bool,
+    ) -> Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(|request: &wiremock::Request| {
@@ -1382,11 +1398,12 @@ mod tests {
                 &json!({
                     "model": "route",
                     "input": "Call get_weather for Paris",
+                    "conversation": conversation,
                     "tools": [{
                         "type": "function", "name": "get_weather",
                         "parameters": {"type": "object"}
                     }],
-                    "store": true
+                    "store": store
                 }),
             )
             .map_err(|error| LibsyError::external("decoding seed request", error))?,
@@ -1414,7 +1431,7 @@ mod tests {
                 WireFormat::OpenAiResponses,
                 &json!({
                     "model": "route",
-                    "previous_response_id": "msg_seed",
+                    (field): if field == "conversation" { conversation.clone() } else { json!("msg_seed") },
                     "input": [{
                         "type": "function_call_output",
                         "call_id": "toolu_weather",
@@ -1424,7 +1441,7 @@ mod tests {
                         "type": "function", "name": "get_weather",
                         "parameters": {"type": "object"}
                     }],
-                    "store": true
+                    "store": store
                 }),
             )
             .map_err(|error| LibsyError::external("decoding continuation request", error))?,
@@ -1454,9 +1471,9 @@ mod tests {
                 WireFormat::OpenAiResponses,
                 &json!({
                     "model": "route",
-                    "previous_response_id": "msg_follow",
+                    (field): if field == "conversation" { conversation.clone() } else { json!("msg_follow") },
                     "input": "thanks",
-                    "store": true
+                    "store": store
                 }),
             )
             .map_err(|error| LibsyError::external("decoding chained request", error))?,
@@ -1470,6 +1487,24 @@ mod tests {
         assert_eq!(history.len, 4);
         assert_eq!(history.segment.len(), 2);
         assert!(history.parent.is_some());
+        assert_eq!(
+            clients
+                .inner
+                .state_owners
+                .lock()
+                .owner("msg_seed")
+                .is_some(),
+            store
+        );
+        assert_eq!(
+            clients
+                .inner
+                .state_owners
+                .lock()
+                .owner("msg_follow")
+                .is_some(),
+            store
+        );
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
             clients,
@@ -1713,6 +1748,20 @@ mod tests {
     // Conversation history is recorded only once the stream completes.
     #[tokio::test]
     async fn streamed_cross_format_conversation_state_is_recorded_after_completion() -> Result<()> {
+        for (store, response_id) in [
+            (true, Some("msg_stream")),
+            (false, Some("msg_stream")),
+            (true, None),
+        ] {
+            check_streamed_conversation_state(store, response_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn check_streamed_conversation_state(
+        store: bool,
+        response_id: Option<&str>,
+    ) -> Result<()> {
         let client = Arc::new(CandidateClient {
             calls: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
@@ -1727,10 +1776,14 @@ mod tests {
         seed.llm_request
             .extensions
             .fields
+            .insert("store".to_string(), json!(store));
+        seed.llm_request
+            .extensions
+            .fields
             .insert("conversation".to_string(), json!("conv_stream"));
         let mut response = stream_response(vec![
             LlmResponseChunk::MessageStart {
-                id: Some("msg_stream".to_string()),
+                id: response_id.map(str::to_owned),
                 model: Some("weak".to_string()),
             },
             LlmResponseChunk::TextDelta {
@@ -1766,6 +1819,15 @@ mod tests {
             follow,
         );
         assert_eq!(outcome.request.llm_request.messages.len(), 3);
+        assert_eq!(
+            clients
+                .inner
+                .state_owners
+                .lock()
+                .owner("msg_stream")
+                .is_some(),
+            store && response_id.is_some()
+        );
         assert!(matches!(
             outcome.request.llm_request.messages[0].content.as_slice(),
             [ContentBlock::Text { text }] if text == "seed question"
