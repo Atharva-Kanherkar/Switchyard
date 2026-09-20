@@ -1503,6 +1503,7 @@ mod tests {
         Ok(())
     }
 
+    // Every prior turn must reach the backend on each conversation continuation.
     #[tokio::test]
     async fn responses_conversation_continuation_materializes_for_anthropic() -> Result<()> {
         let server = MockServer::start().await;
@@ -1626,6 +1627,7 @@ mod tests {
         assert!(follow.contains("seed question"));
         assert!(follow.contains("recall question"));
         let third = String::from_utf8_lossy(&requests[2].body);
+        assert!(third.contains("seed question"));
         assert!(third.contains("recall question"));
         assert!(third.contains("thanks question"));
         Ok(())
@@ -1708,6 +1710,7 @@ mod tests {
         Ok(())
     }
 
+    // Conversation history is recorded only once the stream completes.
     #[tokio::test]
     async fn streamed_cross_format_conversation_state_is_recorded_after_completion() -> Result<()> {
         let client = Arc::new(CandidateClient {
@@ -1920,6 +1923,7 @@ mod tests {
         Ok(())
     }
 
+    // Materialized conversation records keep the latest history.
     #[test]
     fn materialized_conversation_state_keeps_latest_history()
     -> std::result::Result<(), LlmClientError> {
