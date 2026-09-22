@@ -1531,6 +1531,10 @@ mod tests {
         assert_eq!(follow["messages"][2]["content"][0]["type"], "tool_result");
         let third: Value = serde_json::from_slice(&requests[2].body)
             .map_err(|error| LibsyError::external("decoding captured request", error))?;
+        assert_eq!(
+            third["messages"][0]["content"],
+            "Call get_weather for Paris"
+        );
         assert_eq!(third["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(third["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(third["messages"][3]["content"], "sunny");
@@ -1538,138 +1542,20 @@ mod tests {
         Ok(())
     }
 
-    // Every prior turn must reach the backend on each conversation continuation.
+    // Stream state is recorded under the response and conversation ids only after completion.
     #[tokio::test]
-    async fn responses_conversation_continuation_materializes_for_anthropic() -> Result<()> {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(|request: &wiremock::Request| {
-                let body: Value = serde_json::from_slice(&request.body).expect("request JSON");
-                let text = body.to_string();
-                let id = if text.contains("thanks question") {
-                    "msg_third"
-                } else if text.contains("recall question") {
-                    "msg_follow"
-                } else {
-                    "msg_seed"
-                };
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "id": id, "type": "message", "role": "assistant", "model": "weak",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
-                    "usage": {"input_tokens": 1, "output_tokens": 1}
-                }))
-            })
-            .mount(&server)
-            .await;
-
-        let client: Arc<dyn RoutedLlmClient> = Arc::new(
-            TranslatingLlmClient::new(&[ModelConfig::new(
-                "weak",
-                Backend::Anthropic(HttpBackendConfig {
-                    base_url: server.uri(),
-                    api_key: None,
-                    forward_auth: false,
-                    extra_headers: BTreeMap::new(),
-                    extra_body: BTreeMap::new(),
-                    reasoning_effort: None,
-                    max_retries: 0,
-                    timeout: None,
-                }),
-                None,
-            )])
-            .map_err(|error| LibsyError::external("building test client", error))?,
-        );
-        let clients = ClientRouter::new(HashMap::from([(ModelId::from("weak"), client)]));
-        let models = to_category_map(&["weak"]);
-
-        let request = |input: &str| {
-            let llm_request = switchyard_translation::decode_request(
-                WireFormat::OpenAiResponses,
-                &json!({
-                    "model": "route",
-                    "input": input,
-                    "conversation": "conv_081",
-                    "store": true
-                }),
-            )
-            .map_err(|error| LibsyError::external("decoding request", error));
-            Ok::<Request, LibsyError>(Request {
-                llm_request: llm_request?,
-                raw_request: None,
-                metadata: None,
-            })
-        };
-
-        let (_, response) = run(
-            Arc::new(switchyard_libsy::Passthrough),
-            clients.clone(),
-            request("seed question")?,
-            models.clone(),
-            None,
-        )
-        .await?;
-        assert_eq!(
-            response
-                .llm_response
-                .as_agg()
-                .and_then(|agg| agg.id.as_deref()),
-            Some("msg_seed")
-        );
-
-        let (_, response) = run(
-            Arc::new(switchyard_libsy::Passthrough),
-            clients.clone(),
-            request("recall question")?,
-            models.clone(),
-            None,
-        )
-        .await?;
-        assert_eq!(
-            completion_text(
-                response
-                    .llm_response
-                    .as_agg()
-                    .expect("buffered follow-up response")
-            ),
-            "ok"
-        );
-
-        let (_, response) = run(
-            Arc::new(switchyard_libsy::Passthrough),
-            clients,
-            request("thanks question")?,
-            models,
-            None,
-        )
-        .await?;
-        assert_eq!(
-            completion_text(
-                response
-                    .llm_response
-                    .as_agg()
-                    .expect("buffered chained response")
-            ),
-            "ok"
-        );
-
-        let requests = server.received_requests().await.expect("request recording");
-        assert_eq!(requests.len(), 3);
-        let seed = String::from_utf8_lossy(&requests[0].body);
-        assert!(seed.contains("seed question"));
-        assert!(!seed.contains("recall question"));
-        let follow = String::from_utf8_lossy(&requests[1].body);
-        assert!(follow.contains("seed question"));
-        assert!(follow.contains("recall question"));
-        let third = String::from_utf8_lossy(&requests[2].body);
-        assert!(third.contains("seed question"));
-        assert!(third.contains("recall question"));
-        assert!(third.contains("thanks question"));
+    async fn streamed_cross_format_state_is_recorded_only_after_completion() -> Result<()> {
+        for (store, response_id) in [
+            (true, Some("msg_stream")),
+            (false, Some("msg_stream")),
+            (true, None),
+        ] {
+            check_streamed_state(store, response_id).await?;
+        }
         Ok(())
     }
 
-    #[tokio::test]
-    async fn streamed_cross_format_state_is_recorded_only_after_completion() -> Result<()> {
+    async fn check_streamed_state(store: bool, response_id: Option<&str>) -> Result<()> {
         let client = Arc::new(CandidateClient {
             calls: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
@@ -1685,9 +1571,17 @@ mod tests {
             .preservation
             .requests
             .insert(WireFormat::OpenAiResponses.into(), json!({}));
+        seed.llm_request
+            .extensions
+            .fields
+            .insert("store".to_string(), json!(store));
+        seed.llm_request
+            .extensions
+            .fields
+            .insert("conversation".to_string(), json!("conv_stream"));
         let mut response = stream_response(vec![
             LlmResponseChunk::MessageStart {
-                id: Some("msg_stream".to_string()),
+                id: response_id.map(str::to_owned),
                 model: Some("weak".to_string()),
             },
             LlmResponseChunk::ToolCallDelta {
@@ -1703,143 +1597,62 @@ mod tests {
         response.set_served_model(&ModelId::from("weak"));
         let response = clients.remember_state_owner(&seed, response)?;
 
-        let mut follow = request();
-        follow
-            .llm_request
-            .extensions
-            .fields
-            .insert("previous_response_id".to_string(), json!("msg_stream"));
-        follow.llm_request.messages = vec![Message {
-            role: Role::Tool,
-            content: vec![ContentBlock::ToolResult(ToolResult {
-                tool_call_id: "toolu_stream".to_string(),
-                content: vec![ContentBlock::Text {
-                    text: "ready".to_string(),
-                }],
-                is_error: None,
-            })],
-        }];
-        assert!(clients.stored_state_owner(&follow).is_none());
-        response
-            .llm_response
-            .into_agg()
-            .await
-            .map_err(|error| LibsyError::client_call("weak", error))?;
-
-        let outcome = continue_on(
-            clients
-                .stored_state_owner(&follow)
-                .expect("completed stream state"),
-            "passthrough",
-            follow,
-        );
-        assert_eq!(outcome.request.llm_request.messages.len(), 3);
-        assert!(matches!(
-            outcome.request.llm_request.messages[1].content.as_slice(),
-            [ContentBlock::ToolCall(call)] if call.id == "toolu_stream"
-        ));
-        assert!(matches!(
-            outcome.request.llm_request.messages[2].content.as_slice(),
-            [ContentBlock::ToolResult(result)] if result.tool_call_id == "toolu_stream"
-        ));
-        Ok(())
-    }
-
-    // Conversation history is recorded only once the stream completes.
-    #[tokio::test]
-    async fn streamed_cross_format_conversation_state_is_recorded_after_completion() -> Result<()> {
-        for (store, response_id) in [
-            (true, Some("msg_stream")),
-            (false, Some("msg_stream")),
-            (true, None),
-        ] {
-            check_streamed_conversation_state(store, response_id).await?;
+        let follow = |field: &str, value: Value| {
+            let mut follow = request();
+            follow
+                .llm_request
+                .extensions
+                .fields
+                .insert(field.to_string(), value);
+            follow.llm_request.messages = vec![Message {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult(ToolResult {
+                    tool_call_id: "toolu_stream".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "ready".to_string(),
+                    }],
+                    is_error: None,
+                })],
+            }];
+            follow
+        };
+        let follows = [
+            (
+                follow("previous_response_id", json!("msg_stream")),
+                store && response_id.is_some(),
+            ),
+            (follow("conversation", json!("conv_stream")), true),
+        ];
+        for (follow, _) in &follows {
+            assert!(clients.stored_state_owner(follow).is_none());
         }
-        Ok(())
-    }
-
-    async fn check_streamed_conversation_state(
-        store: bool,
-        response_id: Option<&str>,
-    ) -> Result<()> {
-        let client = Arc::new(CandidateClient {
-            calls: Mutex::new(Vec::new()),
-            requests: Mutex::new(Vec::new()),
-            first: FirstOutcome::StreamSuccess,
-        });
-        let clients = ClientRouter::new(HashMap::from([(
-            ModelId::from("weak"),
-            client as Arc<dyn RoutedLlmClient>,
-        )]));
-        let mut seed = request();
-        seed.llm_request.messages = vec![Message::text(Role::User, "seed question")];
-        seed.llm_request
-            .extensions
-            .fields
-            .insert("store".to_string(), json!(store));
-        seed.llm_request
-            .extensions
-            .fields
-            .insert("conversation".to_string(), json!("conv_stream"));
-        let mut response = stream_response(vec![
-            LlmResponseChunk::MessageStart {
-                id: response_id.map(str::to_owned),
-                model: Some("weak".to_string()),
-            },
-            LlmResponseChunk::TextDelta {
-                index: 0,
-                text: "streamed".to_string(),
-            },
-            LlmResponseChunk::MessageStop {
-                reason: Some("stop".to_string()),
-            },
-        ]);
-        response.set_served_model(&ModelId::from("weak"));
-        let response = clients.remember_state_owner(&seed, response)?;
-
-        let mut follow = request();
-        follow
-            .llm_request
-            .extensions
-            .fields
-            .insert("conversation".to_string(), json!("conv_stream"));
-        follow.llm_request.messages = vec![Message::text(Role::User, "recall question")];
-        assert!(clients.stored_state_owner(&follow).is_none());
         response
             .llm_response
             .into_agg()
             .await
             .map_err(|error| LibsyError::client_call("weak", error))?;
 
-        let outcome = continue_on(
-            clients
-                .stored_state_owner(&follow)
-                .expect("completed conversation stream state"),
-            "passthrough",
-            follow,
-        );
-        assert_eq!(outcome.request.llm_request.messages.len(), 3);
-        assert_eq!(
-            clients
-                .inner
-                .state_owners
-                .lock()
-                .owner("msg_stream")
-                .is_some(),
-            store && response_id.is_some()
-        );
-        assert!(matches!(
-            outcome.request.llm_request.messages[0].content.as_slice(),
-            [ContentBlock::Text { text }] if text == "seed question"
-        ));
-        assert!(matches!(
-            outcome.request.llm_request.messages[1].content.as_slice(),
-            [ContentBlock::Text { text }] if text == "streamed"
-        ));
-        assert!(matches!(
-            outcome.request.llm_request.messages[2].content.as_slice(),
-            [ContentBlock::Text { text }] if text == "recall question"
-        ));
+        for (follow, retained) in follows {
+            let Some(owner) = clients.stored_state_owner(&follow) else {
+                assert!(!retained);
+                continue;
+            };
+            assert!(retained);
+            let outcome = continue_on(owner, "passthrough", follow);
+            assert_eq!(outcome.request.llm_request.messages.len(), 3);
+            assert!(matches!(
+                outcome.request.llm_request.messages[0].content.as_slice(),
+                [ContentBlock::Text { text }] if text == "inspect"
+            ));
+            assert!(matches!(
+                outcome.request.llm_request.messages[1].content.as_slice(),
+                [ContentBlock::ToolCall(call)] if call.id == "toolu_stream"
+            ));
+            assert!(matches!(
+                outcome.request.llm_request.messages[2].content.as_slice(),
+                [ContentBlock::ToolResult(result)] if result.tool_call_id == "toolu_stream"
+            ));
+        }
         Ok(())
     }
 
