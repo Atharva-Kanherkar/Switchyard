@@ -11,12 +11,13 @@ use std::sync::Arc;
 
 use libsy::{
     AdvisorGate, AdvisorGateConfig, Algorithm, BreakerConfig, CapabilityJudgeConfig,
-    ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger, CompositeRouter,
-    CompositeRouterConfig, CustomClassifierConfig, CustomClassifierPolicy, DecisionJudgeConfig,
-    EscalationJudgeConfig, GateTrigger, HandoffNoteConfig, LlmCapabilityConfig,
-    LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop, Passthrough, PickerMode,
-    PlanExecute, PlanExecuteConfig, Random, RuntimeModels, StageRouter, StageRouterConfig,
-    SubagentRouter, SubagentRouterConfig, TaskClassifierConfig, ToolSemantics, Vgr, VgrConfig,
+    ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger, CompositeJudgeConfig,
+    CompositeRouter, CompositeRouterConfig, CustomClassifierConfig, CustomClassifierPolicy,
+    DecisionJudgeConfig, EscalationJudgeConfig, GateTrigger, HandoffNoteConfig,
+    LlmCapabilityConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop, Passthrough,
+    PickerMode, PlanExecute, PlanExecuteConfig, Random, RuntimeModels, StageRouter,
+    StageRouterConfig, SubagentRouter, SubagentRouterConfig, TaskClassifierConfig, ToolSemantics,
+    Vgr, VgrConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -574,6 +575,13 @@ pub enum AdvisorTriggerConfig {
 pub struct StageClassifierConfig {
     /// Target the judge is called through. Not a routing destination.
     pub target: String,
+    /// Composite accepts custom-schema judges as well as capability judges.
+    #[serde(default)]
+    pub mode: Option<ClassifierMode>,
+    #[serde(default)]
+    pub response_schema: Option<String>,
+    #[serde(default)]
+    pub policy: Option<ClassifierPolicyConfig>,
     #[serde(default)]
     pub decision: Option<DecisionJudgeRouteConfig>,
     #[serde(default)]
@@ -645,6 +653,16 @@ impl StageClassifierConfig {
         tiers: &StageTierConfig,
         targets: &BTreeMap<String, ModelId>,
     ) -> AlgorithmResult<TaskClassifierConfig> {
+        if self
+            .mode
+            .is_some_and(|mode| !matches!(mode, ClassifierMode::Capability))
+            || self.response_schema.is_some()
+            || self.policy.is_some()
+        {
+            return Err(AlgorithmConfigError::new(
+                "custom classifier settings require composite with mode = custom",
+            ));
+        }
         let config = LlmClassifierRouteConfig {
             classifier_target: self.target.clone(),
             strong_target: Some(tiers.capable_target.clone()),
@@ -667,6 +685,44 @@ impl StageClassifierConfig {
             }
             _ => Err(AlgorithmConfigError::new("expected a capability judge")),
         }
+    }
+
+    fn custom_classifier_config(
+        &self,
+        route_name: &str,
+    ) -> AlgorithmResult<CustomClassifierConfig> {
+        if self.fail_open == Some(false) {
+            return Err(AlgorithmConfigError::new(
+                "composite custom classifiers always fail open; remove fail_open = false",
+            ));
+        }
+        if self.decision.is_some()
+            || self.base_threshold.is_some()
+            || self.threshold_step.is_some()
+            || self.response_format_type != ClassifierResponseFormat::JsonSchema
+        {
+            return Err(AlgorithmConfigError::new(
+                "composite custom classifier cannot use capability thresholds, decision settings, or response_format_type",
+            ));
+        }
+        let schema =
+            required_classifier_field(route_name, "response_schema", &self.response_schema)?;
+        let schema = serde_json::from_str(&schema).map_err(|error| {
+            AlgorithmConfigError::with_source(
+                format!("composite route {route_name}: response_schema is invalid JSON"),
+                error,
+            )
+        })?;
+        let mut config = CustomClassifierConfig::new(
+            required_classifier_field(route_name, "prompt", &self.prompt)?,
+            schema,
+            required_classifier_field(route_name, "policy", &self.policy)?.into_libsy(),
+        );
+        config.classify_trigger = self.classify_trigger;
+        config.message_hash_fallback = self.message_hash_fallback;
+        config.recent_turn_window = self.recent_turn_window;
+        config.max_output_tokens = self.max_output_tokens;
+        Ok(config)
     }
 }
 
@@ -1600,11 +1656,18 @@ fn build_algorithm(
             }
             stage_config.tool_semantics = stage.tool_semantics.clone();
             stage_config.handoff_notes = stage.handoff_notes.clone();
-            let config = CompositeRouterConfig {
-                judge: classifier.task_classifier_config(route_name, stage, targets)?,
-                stage: stage_config,
+            let judge = if matches!(classifier.mode, Some(ClassifierMode::Custom)) {
+                CompositeJudgeConfig::Custom(classifier.custom_classifier_config(route_name)?)
+            } else {
+                CompositeJudgeConfig::Capability(
+                    classifier.task_classifier_config(route_name, stage, targets)?,
+                )
             };
-            let algorithm = CompositeRouter::new(config).map_err(|error| {
+            let algorithm = CompositeRouter::new(CompositeRouterConfig {
+                judge,
+                stage: stage_config,
+            })
+            .map_err(|error| {
                 AlgorithmConfigError::with_source(
                     format!("composite route {route_name}: {error}"),
                     error,
