@@ -38,6 +38,22 @@ route sets `context_window`, `/v1/models` advertises that configured limit.
 run that recovered from tool errors commit locally once that many trailing tool
 results are clean and the cloud judge confirms the evidence.
 
+## Agentic handoff
+
+These settings are off by default:
+
+```toml
+agentic_handoff = true
+local_turn_budget_seconds = 600
+```
+
+`agentic_handoff` tells the cloud tier when it takes over tool-using work that
+the local tier previously served. The notice can include the local tier's
+unchecked final message. It is sent at most once per user turn, and only after
+new local work has been served since the previous handoff. The handoff preserves
+the conversation's existing messages and content. `local_turn_budget_seconds`
+escalates a user turn once the local tier has spent that much wall-clock time on it.
+
 ## Serving modes
 
 - `off` skips candidate generation and serves cloud. This is the default.

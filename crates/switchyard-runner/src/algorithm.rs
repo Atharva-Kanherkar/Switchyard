@@ -546,6 +546,12 @@ pub struct VgrRouteConfig {
     /// Clean trailing tool results that let a long run recover on the cloud judge.
     #[serde(default)]
     pub confirmed_recovery_min_clean_tail: Option<u32>,
+    /// Tells the capable tier it inherits unverified tool-using work.
+    #[serde(default)]
+    pub agentic_handoff: bool,
+    /// Wall-clock budget for the local tier within one user turn.
+    #[serde(default)]
+    pub local_turn_budget_seconds: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1798,6 +1804,11 @@ fn build_vgr(
     runtime.deadline = duration(route_name, "deadline_seconds", config.deadline_seconds)?;
     runtime.task_typing = config.task_typing;
     runtime.confirmed_recovery_min_clean_tail = config.confirmed_recovery_min_clean_tail;
+    runtime.agentic_handoff = config.agentic_handoff;
+    runtime.local_turn_budget = config
+        .local_turn_budget_seconds
+        .map(|seconds| duration(route_name, "local_turn_budget_seconds", seconds))
+        .transpose()?;
     runtime.breaker = BreakerConfig {
         threshold: config.breaker_threshold,
         cooldown: duration(
