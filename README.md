@@ -11,6 +11,7 @@ Use Switchyard through a gateway integration, try it with a local proxy, or embe
 <p align="center">
   <a href="docs/getting_started.md">Quickstart</a> &emsp;·&emsp;
   <a href="https://nvidia-nemo.github.io/Switchyard/">Documentation</a> &emsp;·&emsp;
+  <a href="#whats-new">What’s new</a> &emsp;·&emsp;
   <a href="https://github.com/NVIDIA-NeMo/Switchyard/issues/1026">Roadmap</a> &emsp;·&emsp;
   <a href="https://github.com/NVIDIA-NeMo/Switchyard/releases">Releases</a> &emsp;·&emsp;
   <a href="CONTRIBUTING.md">Contributing</a>
@@ -51,6 +52,25 @@ Agent-specific guides are available for [pi](docs/integrations/pi.md) and
 ### Embed the library in your harness
 
 [Embed the library in your harness](docs/getting_started.md#library-path) to run routing inside your Rust application. For Python, see the [embedding example](examples/libsy.py).
+
+## What’s new
+
+Features and integrations recently merged into `main`.
+
+- **2026-10-16 · Route between Sonnet and Opus in Claude Code**\
+  Use your Claude login for automatic routing on Linux x86_64 and see the selected model in the status line. [Setup guide →](examples/claude/README.md)
+
+- **2026-10-15 · Use decision models in composite routing**\
+  Use Mercury Decide to judge tasks and Stage routing to adjust model selection as tools run. [Example configuration →](dev-server/config.toml)
+
+- **2026-10-13 · Use Jev to choose between models**\
+  Configure Jev as a task judge with candidate descriptions and a probability cutoff. [Configuration guide →](docs/routing_algorithms/composite_routing.md#decision-model-classifier)
+
+- **2026-10-12 · Bring Switchyard to TypeScript and Pi**\
+  Select models in Node.js or try automatic routing through Pi’s virtual models. [TypeScript bindings →](bindings/typescript/README.md) · [Pi example →](examples/pi/README.md)
+
+- **2026-10-08 · Run Codex with Switchyard on macOS**\
+  Install a background router and Codex profile, then track usage and estimated savings from the menu bar. [Setup guide →](crates/switchyard-menubar/README.md)
 
 ## Routing algorithms
 
