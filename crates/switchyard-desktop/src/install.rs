@@ -15,18 +15,26 @@ use std::{
 };
 
 pub mod credentials;
+// Linux and any other system without launchd or Task Scheduler use systemd; execute rejects
+// unsupported systems before they change anything.
+#[cfg(not(any(target_os = "macos", windows)))]
+mod linux;
+#[cfg(not(any(target_os = "macos", windows)))]
+use linux as platform;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as platform;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(windows)]
+use windows as platform;
 
 pub fn executable_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 const SERVER: &str = "com.nvidia.switchyard.server";
-const DESKTOP: &str = "com.nvidia.switchyard.desktop";
-// Migration removes this LaunchAgent so the old app cannot restart alongside the desktop app.
-const LEGACY_DESKTOP: &str = "com.nvidia.switchyard.menubar";
-const UNIT: &str = "switchyard.service";
 const BUNDLED_CONFIG: &str = include_str!("../../../scripts/config/composite.toml");
 const UPDATE_LOCK: &str = ".switchyard-desktop-update.lock";
 const PORT_ERROR: &str = "SY_PORT must be a number from 1 to 65535.";
@@ -529,20 +537,6 @@ fn removal_notes(s: &Settings) -> Vec<String> {
             ));
         }
     }
-    for path in [
-        s.codex_home.join("config.sy.toml"),
-        s.codex_home.join("config.toml.direct"),
-        s.home.join(".zshrc"),
-        s.home.join(".bashrc"),
-    ] {
-        if path.exists() {
-            notes.push(format!(
-                "Review legacy Switchyard cleanup: {}. Active defaults are copied before \
-                 restoring config.toml.direct; marked shell/profile blocks are removed.",
-                path.display()
-            ));
-        }
-    }
     notes.push("Custom destinations outside these known locations are not inventoried.".into());
     notes.push(
         "Restore routing from Connect tools before uninstalling. \
@@ -695,7 +689,7 @@ fn install(s: &Settings, preserve_profile: bool) -> Result<Option<String>, Strin
         "Build and config validation passed. Replacing the installation.",
     )?;
     replace_installation(s, prepared.desktop_settings.as_deref())?;
-    install_services(s, prepared.missing_keys.is_empty())?;
+    platform::install(s, prepared.missing_keys.is_empty())?;
     if !preserve_profile || !present(&s.profile_file())? {
         save_profile(s, &prepared.profile)?;
     }
@@ -711,11 +705,8 @@ fn prepare(s: &Settings, preserve_profile: bool) -> Result<Prepared, String> {
     } else {
         codex_profile(s, context_window)
     };
-    if cfg!(target_os = "macos") {
-        run(Command::new("launchctl").arg("help"))?;
-    } else if cfg!(target_os = "linux") {
-        run(systemctl(&["show-environment"]).stdout(Stdio::null()))?;
-    }
+    #[cfg(not(windows))]
+    platform::preflight()?;
     let desktop_settings = reconcile_desktop_port(s)?;
     build(s)?;
     let missing_keys = check_server_config(s, !preserve_profile || !profile.exists())?;
@@ -782,9 +773,8 @@ fn check_server_config(s: &Settings, require_route: bool) -> Result<Vec<String>,
 /// before the services stop.
 fn replace_installation(s: &Settings, desktop_settings: Option<&str>) -> Result<(), String> {
     let metadata = toml::to_string(s).map_err(err)?;
-    let bundle = cfg!(target_os = "macos")
-        .then(|| stage_bundle(s, &metadata))
-        .transpose()?;
+    #[cfg(target_os = "macos")]
+    let bundle = platform::stage_bundle(s, &metadata)?;
     fs::create_dir_all(&s.sy_home).map_err(err)?;
     set_update_state(
         s,
@@ -792,7 +782,7 @@ fn replace_installation(s: &Settings, desktop_settings: Option<&str>) -> Result<
         "services",
         "Stopping services and replacing app files. Existing config and history are retained.",
     )?;
-    stop_services(s)?;
+    platform::stop(s)?;
     fs::create_dir_all(s.sy_home.join("logs")).map_err(err)?;
     #[cfg(windows)]
     windows::replace_binaries(s)?;
@@ -805,30 +795,18 @@ fn replace_installation(s: &Settings, desktop_settings: Option<&str>) -> Result<
         let bytes = fs::read(s.release(binary)).map_err(err)?;
         write(&s.binary(binary), &bytes, true)?;
     }
-    migrate_settings(s, desktop_settings)?;
-    remove(&s.sy_home.join("bin/switchyard-menubar"))?;
+    write_once(&s.sy_home.join("composite.toml"), BUNDLED_CONFIG)?;
+    if let Some(text) = desktop_settings {
+        write(&s.desktop_settings(), text.as_bytes(), false)?;
+    } else {
+        write_once(&s.desktop_settings(), &desktop_config(s))?;
+    }
     for record in [s.sy_home.join("install.toml"), s.install_record()] {
         write(&record, metadata.as_bytes(), false)?;
     }
-    if let Some(stage) = bundle {
-        replace_app(s, stage)?;
-    }
+    #[cfg(target_os = "macos")]
+    platform::replace_app(s, bundle)?;
     Ok(())
-}
-
-/// Creates the server config and app settings when they are missing and moves the old menu bar
-/// settings to desktop.toml. `desktop_settings` replaces the app settings when the port changed.
-fn migrate_settings(s: &Settings, desktop_settings: Option<&str>) -> Result<(), String> {
-    write_once(&s.sy_home.join("composite.toml"), BUNDLED_CONFIG)?;
-    let legacy = s.sy_home.join("menubar.toml");
-    if present(&legacy)? && !present(&s.desktop_settings())? {
-        fs::rename(&legacy, s.desktop_settings()).map_err(err)?;
-    }
-    write_once(&s.desktop_settings(), &desktop_config(s))?;
-    match desktop_settings {
-        Some(text) => write(&s.desktop_settings(), text.as_bytes(), false),
-        None => Ok(()),
-    }
 }
 
 fn save_profile(s: &Settings, text: &str) -> Result<(), String> {
@@ -916,11 +894,7 @@ fn check_public_route(config: &Path, model: &str) -> Result<(), String> {
 }
 
 fn reconcile_desktop_port(s: &Settings) -> Result<Option<String>, String> {
-    let path = if s.desktop_settings().exists() {
-        s.desktop_settings()
-    } else {
-        s.sy_home.join("menubar.toml")
-    };
+    let path = s.desktop_settings();
     let Some(text) = read_optional(&path).map_err(|e| format!("Read {}: {e}", path.display()))?
     else {
         return Ok(None);
@@ -1061,294 +1035,13 @@ fn desktop_config(s: &Settings) -> String {
 fn toml_string(value: &str) -> String {
     toml::Value::String(value.into()).to_string()
 }
+#[cfg(any(target_os = "macos", windows))]
 fn xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
-fn plist(label: &str, args: &[String], log: &Path, app: bool) -> String {
-    let args: String = args
-        .iter()
-        .map(|a| format!("<string>{}</string>", xml(a)))
-        .collect();
-    let keep_alive = if app {
-        "<dict><key>SuccessfulExit</key><false/></dict>\
-         <key>LimitLoadToSessionType</key><string>Aqua</string>"
-    } else {
-        "<true/><key>EnvironmentVariables</key><dict>\
-         <key>RUST_LOG</key><string>info</string></dict>"
-    };
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
-         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\
-         <plist version=\"1.0\"><dict>\
-         <key>Label</key><string>{label}</string>\
-         <key>ProgramArguments</key><array>{args}</array>\
-         <key>RunAtLoad</key><true/>\
-         <key>KeepAlive</key>{keep_alive}\
-         <key>StandardOutPath</key><string>{}</string>\
-         <key>StandardErrorPath</key><string>{}</string>\
-         </dict></plist>",
-        xml(&log.with_extension("log").to_string_lossy()),
-        xml(&log.with_extension("err.log").to_string_lossy())
-    )
-}
-
-fn domain() -> Result<String, String> {
-    let output = Command::new("id").arg("-u").output().map_err(err)?;
-    if !output.status.success() {
-        return Err("Could not read the current user ID.".into());
-    }
-    Ok(format!(
-        "gui/{}",
-        String::from_utf8_lossy(&output.stdout).trim()
-    ))
-}
-fn systemctl(args: &[&str]) -> Command {
-    let mut command = Command::new("systemctl");
-    command.arg("--user").args(args);
-    command
-}
-
-fn stop_services(s: &Settings) -> Result<(), String> {
-    if cfg!(target_os = "macos") {
-        let domain = domain()?;
-        for label in [SERVER, DESKTOP, LEGACY_DESKTOP] {
-            stop_launchd_job(&format!("{domain}/{label}"))?;
-        }
-        remove(&s.service_dir.join(format!("{LEGACY_DESKTOP}.plist")))?;
-    } else if cfg!(windows) {
-        #[cfg(windows)]
-        windows::stop(s)?;
-    } else if present(&s.service_dir.join(UNIT))? {
-        run(&mut systemctl(&["stop", UNIT]))?;
-    }
-    Ok(())
-}
-fn install_services(s: &Settings, keys_saved: bool) -> Result<(), String> {
-    if cfg!(target_os = "macos") {
-        install_launch_agents(s)?;
-    } else if cfg!(windows) {
-        #[cfg(windows)]
-        windows::install(s)?;
-    } else {
-        install_systemd_unit(s, keys_saved)?;
-    }
-    Ok(())
-}
-/// Removes the service definitions and the app. SY_HOME keeps settings, accounts, and history.
-fn remove_app_and_services(s: &Settings) -> Result<(), String> {
-    if cfg!(target_os = "macos") {
-        for label in [SERVER, DESKTOP, LEGACY_DESKTOP] {
-            remove(&s.service_dir.join(format!("{label}.plist")))?;
-        }
-        if present(&s.app())? {
-            fs::remove_dir_all(s.app()).map_err(err)?;
-        }
-    } else if cfg!(windows) {
-        #[cfg(windows)]
-        windows::uninstall(s)?;
-    } else {
-        let unit = s.service_dir.join(UNIT);
-        if present(&unit)? {
-            run(&mut systemctl(&["disable", UNIT]))?;
-            remove(&unit)?;
-        }
-        run(&mut systemctl(&["daemon-reload"]))?;
-    }
-    Ok(())
-}
-
-fn launchd_job_loaded(job: &str) -> Result<bool, String> {
-    Command::new("launchctl")
-        .args(["print", job])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .map_err(err)
-}
-fn stop_launchd_job(job: &str) -> Result<(), String> {
-    if !launchd_job_loaded(job)? {
-        return Ok(());
-    }
-    run(Command::new("launchctl").args(["bootout", job]))?;
-    for _ in 0..50 {
-        if !launchd_job_loaded(job)? {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!(
-        "{job} did not stop within five seconds. Try again."
-    ))
-}
-
-fn stage_bundle(s: &Settings, metadata: &str) -> Result<tempfile::TempDir, String> {
-    let app = s.app();
-    let parent = app.parent().ok_or("The app has no parent directory.")?;
-    fs::create_dir_all(parent).map_err(err)?;
-    let stage = tempfile::tempdir_in(parent).map_err(err)?;
-    let app = stage.path().join("Switchyard.app");
-    let info = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <plist version=\"1.0\"><dict>\
-         <key>CFBundleIdentifier</key><string>com.nvidia.switchyard</string>\
-         <key>CFBundleName</key><string>Switchyard</string>\
-         <key>CFBundleDisplayName</key><string>Switchyard</string>\
-         <key>CFBundleExecutable</key><string>switchyard-desktop</string>\
-         <key>CFBundleIconFile</key><string>Switchyard.icns</string>\
-         <key>CFBundlePackageType</key><string>APPL</string>\
-         <key>CFBundleShortVersionString</key><string>{}</string>\
-         <key>LSMinimumSystemVersion</key><string>12.0</string>\
-         <key>NSHighResolutionCapable</key><true/>\
-         </dict></plist>",
-        env!("CARGO_PKG_VERSION")
-    );
-    let desktop = fs::read(s.release("switchyard-desktop")).map_err(err)?;
-    for (file, bytes, executable) in [
-        ("MacOS/switchyard-desktop", &desktop[..], true),
-        ("Resources/install.toml", metadata.as_bytes(), false),
-        (
-            "Resources/Switchyard.icns",
-            &include_bytes!("../icons/icon.icns")[..],
-            false,
-        ),
-        ("Info.plist", info.as_bytes(), false),
-    ] {
-        write(&app.join("Contents").join(file), bytes, executable)?;
-    }
-    run(Command::new("codesign")
-        .args(["--force", "--deep", "--sign", "-"])
-        .arg(&app))?;
-    Ok(stage)
-}
-
-fn replace_app(s: &Settings, stage: tempfile::TempDir) -> Result<(), String> {
-    let previous = stage.path().join("Previous.app");
-    let existed = present(&s.app())?;
-    if existed {
-        fs::rename(s.app(), &previous).map_err(err)?;
-    }
-    let Err(error) = fs::rename(stage.path().join("Switchyard.app"), s.app()) else {
-        return Ok(());
-    };
-    if existed {
-        fs::rename(&previous, s.app())
-            .map_err(|restore| format!("Replace app: {error}. Restore previous app: {restore}"))?;
-    }
-    Err(format!("Replace app: {error}"))
-}
-
-fn install_launch_agents(s: &Settings) -> Result<(), String> {
-    let server = [
-        s.binary("switchyard-desktop-install").display().to_string(),
-        "serve".into(),
-        "--settings".into(),
-        s.sy_home.join("install.toml").display().to_string(),
-    ];
-    let desktop = [
-        s.app()
-            .join("Contents/MacOS/switchyard-desktop")
-            .display()
-            .to_string(),
-        s.desktop_settings().display().to_string(),
-    ];
-    for (label, args, log, app) in [
-        (SERVER, &server[..], "logs/server", false),
-        (DESKTOP, &desktop[..], "logs/desktop", true),
-    ] {
-        let job = plist(label, args, &s.sy_home.join(log), app);
-        write(
-            &s.service_dir.join(format!("{label}.plist")),
-            job.as_bytes(),
-            false,
-        )?;
-    }
-    let domain = domain()?;
-    for label in [SERVER, DESKTOP] {
-        run(Command::new("launchctl")
-            .arg("bootstrap")
-            .arg(&domain)
-            .arg(s.service_dir.join(format!("{label}.plist"))))?;
-        // macOS can defer RunAtLoad jobs until an explicit start is requested.
-        run(Command::new("launchctl")
-            .arg("kickstart")
-            .arg(format!("{domain}/{label}")))?;
-    }
-    Ok(())
-}
-
-fn systemd_arg(path: &Path) -> String {
-    // systemd expands percent specifiers and environment variables inside quoted arguments.
-    format!(
-        "\"{}\"",
-        path.to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('%', "%%")
-            .replace('$', "$$")
-    )
-}
-fn install_systemd_unit(s: &Settings, expect_running: bool) -> Result<(), String> {
-    let unit = format!(
-        "[Unit]\n\
-         Description=Switchyard local server\n\
-         \n\
-         [Service]\n\
-         Type=simple\n\
-         ExecStart={} serve --settings {}\n\
-         Restart=on-failure\n\
-         RestartSec=10\n\
-         Environment=RUST_LOG=info\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        systemd_arg(&s.binary("switchyard-desktop-install")),
-        systemd_arg(&s.sy_home.join("install.toml")),
-    );
-    write(&s.service_dir.join(UNIT), unit.as_bytes(), false)?;
-    run(&mut systemctl(&["daemon-reload"]))?;
-    run(&mut systemctl(&["enable", UNIT]))?;
-    run(&mut systemctl(&["restart", UNIT]))?;
-    // A server waiting for a key exits and restarts until the key is saved.
-    if !expect_running {
-        return Ok(());
-    }
-    thread::sleep(Duration::from_secs(2));
-    run(&mut systemctl(&["is-active", "--quiet", UNIT]))
-        .map_err(|e| format!("{e}. See journalctl --user -u switchyard."))
-}
-
-fn strip_block(path: &Path, start: &str, end: &str) -> Result<(), String> {
-    let Some(text) = read_optional(path).map_err(err)? else {
-        return Ok(());
-    };
-    let mut output = String::new();
-    let mut skipping = false;
-    for line in text.split_inclusive('\n') {
-        skipping |= line.contains(start);
-        if !skipping {
-            output.push_str(line);
-        }
-        if line.contains(end) {
-            skipping = false;
-        }
-    }
-    if skipping {
-        return Err(format!(
-            "{} has an unfinished Switchyard block. No edits were made to this file.",
-            path.display()
-        ));
-    }
-    if text != output {
-        write(path, output.as_bytes(), false)?;
-    }
-    Ok(())
-}
-
 fn uninstall(s: &Settings) -> Result<(), String> {
     let _lock = lock_installation(s)?;
     println!("{}", installation_plan(s, "uninstall"));
@@ -1356,10 +1049,9 @@ fn uninstall(s: &Settings) -> Result<(), String> {
     if profile.exists() {
         backup(&profile, "switchyard-uninstall-recovery")?;
     }
-    stop_services(s)?;
-    remove_app_and_services(s)?;
+    platform::stop(s)?;
+    platform::uninstall(s)?;
     remove(&profile)?;
-    remove_legacy_setup(s)?;
     println!(
         "Removed services, app, and profile. Kept settings, accounts, {}and history at {}.",
         if cfg!(windows) { "" } else { "binaries, " },
@@ -1368,34 +1060,6 @@ fn uninstall(s: &Settings) -> Result<(), String> {
     let recorded = s.install_record();
     if recorded.exists() && Settings::load(&recorded)?.sy_home == s.sy_home {
         remove(&recorded)?;
-    }
-    Ok(())
-}
-
-/// Removes legacy Switchyard edits to Codex and shell startup files. The active config.toml is
-/// backed up before config.toml.direct replaces it.
-fn remove_legacy_setup(s: &Settings) -> Result<(), String> {
-    remove(&s.codex_home.join("config.sy.toml"))?;
-    let config = s.codex_home.join("config.toml");
-    strip_block(
-        &config,
-        "# >>> switchyard sy profile >>>",
-        "# <<< switchyard sy profile <<<",
-    )?;
-    let direct = s.codex_home.join("config.toml.direct");
-    if present(&direct)? {
-        if present(&config)? {
-            backup(&config, "switchyard-current")?;
-        }
-        write(&config, &fs::read(&direct).map_err(err)?, false)?;
-        remove(&direct)?;
-    }
-    for name in [".zshrc", ".bashrc"] {
-        strip_block(
-            &s.home.join(name),
-            "# >>> switchyard codex alias >>>",
-            "# <<< switchyard codex alias <<<",
-        )?;
     }
     Ok(())
 }

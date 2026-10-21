@@ -289,23 +289,19 @@ esac
     fn install_reinstall_update_and_uninstall_keep_user_data() {
         let mut f = Fixture::new();
         let (sy_home, codex) = (f.s.sy_home.clone(), f.s.codex_home.clone());
-        write(&sy_home.join("menubar.toml"), "baseline_model = 'custom'\n");
         write(&sy_home.join("routing.jsonl"), "history");
         write(&codex.join("config.toml"), "user defaults");
-        let legacy_job = f.s.service_dir.join("com.nvidia.switchyard.menubar.plist");
-        if cfg!(target_os = "macos") {
-            write(&legacy_job, "old menu bar job");
-        }
-
-        // A first install moves the old menu bar settings and adds the server URL.
         f.ok("install");
         let settings = f.s.desktop_settings();
         let url = |port| format!("server_url = \"http://127.0.0.1:{port}\"\n");
         assert_eq!(
-            read(&settings),
-            "baseline_model = 'custom'\n".to_owned() + &url(f.s.port)
+            toml(&settings)["server_url"].as_str(),
+            Some(format!("http://127.0.0.1:{}", f.s.port).as_str())
         );
-        assert!(!sy_home.join("menubar.toml").exists());
+        write(
+            &settings,
+            &("baseline_model = 'custom'\n".to_owned() + &url(f.s.port)),
+        );
         let first = read(&f.profile());
         let profile = toml(&f.profile());
         assert_eq!(profile["model"].as_str(), Some(f.s.model.as_str()));
@@ -330,7 +326,6 @@ esac
                 job["ProgramArguments"].as_array().expect("args")[0].as_string(),
                 helper.to_str()
             );
-            assert!(!legacy_job.exists());
         } else {
             let unit = read(&f.s.service_dir.join("switchyard.service"));
             assert!(unit.contains("<local> %% $$/install.toml\""), "{unit}");
@@ -339,12 +334,15 @@ esac
         assert!(!f.s.home.join("unsafe").exists());
 
         // A reinstall on a new port with a route that sets no window backs up the profile,
-        // drops the old window, follows the port, and keeps history and configs.
+        // removes the old window, follows the port, and keeps history and configs.
         f.s.port = health_server();
         f.s.model = "codex-auto-review".into();
         f.save();
         f.ok("install");
-        assert!(read(&settings).ends_with(&url(f.s.port)));
+        assert_eq!(
+            read(&settings),
+            "baseline_model = 'custom'\n".to_owned() + &url(f.s.port)
+        );
         let profile = toml(&f.profile());
         assert_eq!(profile["model"].as_str(), Some("codex-auto-review"));
         assert!(profile.get("model_context_window").is_none());
@@ -375,28 +373,13 @@ esac
         let build = read(&f.s.source.join("target/build-process-group"));
         assert_ne!(build.trim(), unsafe { libc::getpgrp() }.to_string());
 
-        // Uninstall restores the pre-Switchyard Codex defaults, keeps copies of what it
-        // replaces, removes the old shell alias, and keeps history.
-        write(&codex.join("config.toml"), "current");
-        write(&codex.join("config.toml.direct"), "original");
-        let alias = "# >>> switchyard codex alias >>>\nalias codex=old\n";
-        let rc = f.s.home.join(".bashrc");
-        let block = format!("before\n{alias}# <<< switchyard codex alias <<<\nafter\n");
-        write(&rc, &block);
+        // Uninstall keeps the main Codex config, a copy of the profile, and usage history.
         f.ok("uninstall");
-        assert_eq!(read(&codex.join("config.toml")), "original");
-        assert_eq!(f.codex_files("switchyard-current"), ["current"]);
+        assert_eq!(read(&codex.join("config.toml")), "user defaults");
         assert_eq!(f.codex_files("switchyard-uninstall-recovery"), [edited]);
-        assert_eq!(read(&rc), "before\nafter\n");
         assert!(!f.profile().exists() && !f.s.app().exists());
         assert_eq!(read(&sy_home.join("routing.jsonl")), "history");
         f.ok("uninstall");
-
-        // An unfinished alias block is not edited.
-        let unfinished = format!("before\n{alias}after\n");
-        write(&rc, &unfinished);
-        assert!(!f.run("uninstall").status.success());
-        assert_eq!(read(&rc), unfinished);
     }
 
     #[test]
@@ -464,6 +447,66 @@ esac
         write(&f.file, &format!("{}\nunknown = true\n", read(&f.file)));
         assert!(Settings::load(&f.file).is_err());
     }
+}
+
+#[cfg(windows)]
+#[test]
+// The installed helper must refuse changes to its own installation but still allow previews.
+fn installed_windows_helper_rejects_changes_and_allows_previews() {
+    use switchyard_desktop::install::Settings;
+
+    let root = tempfile::tempdir().expect("fixture");
+    let home = root.path();
+    let settings = Settings {
+        home: home.to_path_buf(),
+        sy_home: home.join("state"),
+        codex_home: home.join("codex"),
+        service_dir: home.join("services"),
+        app_dir: Some(home.join("Programs/Switchyard")),
+        source: home.join("source"),
+        cargo: home.join("cargo.exe"),
+        port: 4123,
+        profile: "sy".into(),
+        model: "test-route".into(),
+    };
+    fs::create_dir_all(settings.bin_dir()).expect("bin directory");
+    let helper = settings.binary("switchyard-desktop-install");
+    fs::copy(env!("CARGO_BIN_EXE_switchyard-desktop-install"), &helper).expect("helper");
+    let record = home.join("install.toml");
+    fs::write(&record, toml::to_string(&settings).expect("settings")).expect("record");
+
+    for action in ["install", "update", "uninstall"] {
+        let mut command = Command::new(&helper);
+        command.arg(action);
+        if action == "install" {
+            command
+                .env("HOME", home)
+                .env("LOCALAPPDATA", home)
+                .env("SY_HOME", &settings.sy_home)
+                .env("CODEX_HOME", &settings.codex_home)
+                .env("SY_PROFILE", &settings.profile)
+                .env("SY_MODEL", &settings.model)
+                .env("SY_PORT", settings.port.to_string());
+        } else {
+            command.arg("--settings").arg(&record);
+        }
+        let output = command.output().expect("installer");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{action}");
+        assert!(error.contains("Run cargo desktop"), "{error}");
+        assert!(!settings.sy_home.exists());
+        assert!(!settings.service_dir.exists());
+        assert!(!settings.codex_home.exists());
+        assert!(helper.is_file());
+    }
+    let output = Command::new(&helper)
+        .args(["uninstall", "--dry-run", "--settings"])
+        .arg(&record)
+        .output()
+        .expect("preview");
+    assert!(output.status.success(), "{output:?}");
+    assert!(!settings.sy_home.exists());
+    assert!(helper.is_file());
 }
 
 #[cfg(windows)]
