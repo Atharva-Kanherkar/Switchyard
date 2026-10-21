@@ -51,5 +51,4 @@ type = "llm_classifier"
 classifier_target = "judge"
 strong_target = "strong"
 weak_target = "weak"
-base_threshold = 0.5
 escalation = { confirmations = 2, recent_turn_window = 28, window_message_chars = 500 }
