@@ -19,6 +19,7 @@ use async_trait::async_trait;
 
 use super::fall_through::FallThrough;
 use super::llm_class::{LlmClassifierConfig, LlmTaskClassifier, TaskClassifierConfig};
+use super::util::affinity::ClassifyTrigger;
 use super::util::prompts::prepend_system_prompt;
 use super::util::stage::{
     DecisionSource, HandoffNoteConfig, PickerMode, StageClassifier, Tier, fall_open_tier,
@@ -187,8 +188,21 @@ impl StageRouter {
     /// Routes between the runtime `capable` and `efficient` models. The judge,
     /// when configured, is called through the runtime `judge` model.
     ///
-    /// Errors if either threshold in `config` is outside `[0.0, 1.0]`.
+    /// Errors if either threshold in `config` is outside `[0.0, 1.0]`, or if the
+    /// fallback judge is asked to retain verdicts: it runs on every ambiguous
+    /// turn, so `classify_trigger` and `message_hash_fallback` would do nothing.
     pub fn new(config: StageRouterConfig) -> Result<Self> {
+        if let Some(fallback) = &config.llm_fallback
+            && (fallback.config.classify_trigger != ClassifyTrigger::EveryRequest
+                || fallback.config.message_hash_fallback)
+        {
+            return Err(LibsyError::AlgorithmError {
+                message: "classify_trigger and message_hash_fallback have no effect on the \
+                          stage fallback judge, which runs on every ambiguous turn; remove \
+                          them, or use a composite route to judge once per user turn"
+                    .to_string(),
+            });
+        }
         Ok(Self {
             route: build_stage_route(config)?,
         })
@@ -273,7 +287,6 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    use crate::algorithms::util::affinity::ClassifyTrigger;
     use crate::algorithms::util::stage::{clear_fall_open, set_fall_open};
     use crate::algorithms::util::tier_fixtures::{JUDGE, Recorder, turn_request};
     use crate::core::testing::test_drive_with_models;
@@ -404,6 +417,31 @@ mod tests {
             StageRouter::new(config),
             Err(LibsyError::AlgorithmError { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_retaining_triggers_on_the_fallback_judge() {
+        for (trigger, message_hash_fallback) in [
+            (ClassifyTrigger::UserTurn, false),
+            (ClassifyTrigger::NewSession, false),
+            (ClassifyTrigger::UserTurn, true),
+        ] {
+            let mut config = config();
+            config.llm_fallback = Some(LlmFallback {
+                config: TaskClassifierConfig {
+                    classify_trigger: trigger,
+                    message_hash_fallback,
+                    ..Default::default()
+                },
+            });
+            assert!(
+                matches!(
+                    StageRouter::new(config),
+                    Err(LibsyError::AlgorithmError { .. })
+                ),
+                "{trigger:?} with message_hash_fallback = {message_hash_fallback}"
+            );
+        }
     }
 
     #[test]
@@ -625,37 +663,6 @@ mod tests {
             2,
             "each undecided turn is its own question"
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn the_fallback_judge_ignores_the_retaining_triggers() -> Result<()> {
-        for trigger in [ClassifyTrigger::UserTurn, ClassifyTrigger::NewSession] {
-            let recorder = Arc::new(Recorder::default());
-            let mut config = config_with_judge(&recorder, 0.9);
-            config
-                .llm_fallback
-                .as_mut()
-                .expect("config_with_judge sets a judge")
-                .config
-                .classify_trigger = trigger;
-            let router = recording_router(config)?;
-
-            // Two tool continuations of one user turn in one session. A standalone
-            // capability route with this trigger would judge once and retain the
-            // target; inside the stage cascade the judge is a plain classifier.
-            for _ in 0..2 {
-                test_drive_with_models(
-                    router.clone(),
-                    turn_request(false),
-                    runtime_models(),
-                    recorder.serve(),
-                )
-                .await?;
-            }
-
-            assert_eq!(recorder.judge_calls(), 2, "{trigger:?} retained a verdict");
-        }
         Ok(())
     }
 
