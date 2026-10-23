@@ -24,8 +24,8 @@ flowchart TD
     execute -->|"call.respond(...)"| route
     route -->|"Done"| done
 
-    classDef algorithm fill:#eef6df,stroke:#76b900,color:#24350b
-    classDef application fill:#f5f6f7,stroke:#6b7280,color:#1f2937
+    classDef algorithm fill:#76b9001a,stroke:#76b900,stroke-width:2px
+    classDef application fill:transparent,stroke:#6b7280
     class route algorithm
     class execute,done application
 ```
@@ -161,7 +161,7 @@ Judge-based routing:  CallModel(call) -> your response -> Done(outcome)
 Decision routing:     CallDecision(call) -> your typed response -> Done(outcome)
 ```
 
-## Fulfill a model call
+### `Step::CallModel`
 
 Suppose the next step is `CallModel`. The
 <a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_libsy/struct.CallModel.html"><code>CallModel</code></a>
@@ -178,20 +178,12 @@ assert_eq!(request.model_id().as_ref(), Some(first_candidate));
 the attempts and must update the request's model before trying a later candidate.
 `call.algorithm` names the requesting algorithm for your own telemetry.
 
-Your application returns the result through
-<a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_libsy/struct.CallModel.html#method.respond"><code>call.respond</code></a>.
-Inside the `Step::CallModel(call)` arm, the exchange looks like this:
-
-```rust
-let request = call.request.clone();
-// Pass the work future to respond; it returns the result to the algorithm.
-call.respond(client.call(request)).await?;
-```
-
-Here, `client.call` is your async adapter, returning
-`switchyard_libsy::Result<Response>`. It owns the provider call and any format
-conversion, as in the [OpenRouter adapter](getting_started.md#use-libsy-with-your-client).
-`respond` consumes the call, allowing the algorithm to continue with its result.
+In the [Step loop](#read-the-next-step), `client.call` is your async adapter,
+returning `switchyard_libsy::Result<Response>`. It owns the provider call and any
+format conversion, as in the
+[OpenRouter adapter](getting_started.md#use-libsy-with-your-client).
+<a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_libsy/struct.CallModel.html#method.respond"><code>call.respond</code></a>
+consumes the call and runs that work future, returning its result to the algorithm.
 
 The returned
 <a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_protocol/envelope/struct.Response.html"><code>Response</code></a>
@@ -220,7 +212,7 @@ Its async `call(Request)` returns a `Response` or `LlmClientError`; the
 [host guide](reference/host_integration.md#serve-routing-time-calls) shows the error
 adapter. Using your own adapter method, as above, also works.
 
-## Return a typed decision
+### `Step::CallDecision`
 
 An algorithm can ask a decision model to evaluate a question through
 `Step::CallDecision(call)`. This time, `call` holds a
@@ -229,13 +221,8 @@ It has one `model` and a
 <a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_protocol/decision/struct.DecisionRequest.html"><code>DecisionRequest</code></a>
 in `request`.
 
-The algorithm creates the question. Your application sends the supplied request
-through its decision client and returns the typed answer:
-
-```rust
-let request = call.request.clone();
-call.respond(decision_client.call(request)).await?;
-```
+The algorithm creates the question. The [Step loop](#read-the-next-step) sends
+the supplied request through `decision_client.call` and returns the typed answer.
 
 The adapter returns `switchyard_libsy::Result<DecisionResponse>`. The optional
 shared interface is
@@ -292,7 +279,7 @@ let response = DecisionResponse {
 
 </details>
 
-## Receive the final outcome
+### `Step::Done`
 
 Once the algorithm has enough information, it emits `Step::Done(outcome)` with a
 <a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_libsy/struct.RoutingOutcome.html"><code>RoutingOutcome</code></a>.
@@ -358,37 +345,53 @@ Each call has its own reply channel. Awaiting calls one at a time in the step lo
 serves them sequentially. To run calls concurrently, your application must keep
 reading steps while polling their work.
 
-For concurrent execution, use
-<a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_libsy/fn.drive.html"><code>libsy::drive</code></a>.
-It polls your call handlers concurrently and returns the `RoutingOutcome`. Your
-handler receives
-<a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_libsy/enum.Call.html"><code>Call::Model</code> or <code>Call::Decision</code></a>;
-`drive` handles `Done` itself:
+Use the same inputs and clients, but replace the earlier `run_stream` call and
+sequential loop with this version. `tokio::select!` polls both the Step stream and
+the pending calls, so new calls can start before earlier ones finish:
 
 ```rust
-// Borrow the adapters so every call can use them.
-let client = &client;
-let decision_client = &decision_client;
-let outcome = switchyard_libsy::drive(algorithm, request, models, |call| async move {
-    match call {
-        Call::Model(call) => {
-            let request = call.request.clone();
-            call.respond(client.call(request)).await
-        }
-        Call::Decision(call) => {
-            let request = call.request.clone();
-            call.respond(decision_client.call(request)).await
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use switchyard_libsy::LibsyError;
+
+let mut steps = algorithm.run_stream(request, models, state);
+let mut in_flight = FuturesUnordered::new();
+
+let outcome = loop {
+    tokio::select! {
+        Some(result) = in_flight.next() => result?,
+        step = steps.next() => {
+            let step = step.ok_or(LibsyError::MissingFinalResponse)?;
+            match step? {
+                Step::CallModel(call) => {
+                    let request = call.request.clone();
+                    in_flight.push(call.respond(client.call(request)).boxed());
+                }
+                Step::CallDecision(call) => {
+                    let request = call.request.clone();
+                    in_flight.push(call.respond(decision_client.call(request)).boxed());
+                }
+                Step::Done(outcome) => break *outcome,
+            }
         }
     }
-}).await?;
+};
+// Stop unused calls before handling the final outcome.
+drop(in_flight);
+drop(steps);
 ```
 
-It starts with default state. Use `run_stream` directly to supply your own state
-or execution loop.
+`boxed()` gives the two call kinds a common future type for the collection.
+Only calls requested concurrently by the algorithm can overlap. The returned
+`outcome` is handled as shown in [`Step::Done`](#stepdone).
 
-If the algorithm stops waiting, `respond` drops that call's work future. Dropping
-the step stream aborts the algorithm task; your application cleans up separately
-started work. `drive` drops its outstanding handlers when the run ends or is dropped.
+For a ready-made version, see
+<a href="https://nvidia-nemo.github.io/Switchyard/rust/switchyard_libsy/fn.drive.html"><code>libsy::drive</code></a>
+and its [reference execution loop](../crates/libsy/src/core/algorithm.rs#L593).
+
+If the algorithm stops waiting, `respond` drops that call's work future. The
+explicit drops stop the remaining handlers and abort the algorithm task. Returning
+an error or cancelling the enclosing future also drops these local values. Your
+application must clean up any separately spawned work itself.
 
 A model-call failure normally stops the host run when propagated with `?`.
 `call.recover_errors` lets the algorithm receive and handle it instead. Decision
@@ -397,9 +400,9 @@ unanswered call gives the waiting algorithm `DriverError::ResponseDropped`.
 
 Once a response stream has been delivered, its consumer owns its lifetime.
 Cancelling local work cannot guarantee that a provider stops generation or billing,
-or undo side effects that have already occurred. The [host integration
-guide](reference/host_integration.md#concurrent-calls-and-cancellation) covers host
-cleanup in Rust and Python.
+or undo side effects that have already occurred. See the [host integration
+guide](reference/host_integration.md#concurrent-calls-and-cancellation) for
+Python task cleanup.
 
 The [Rust API reference](reference/rust_api.md) links the complete crate
 documentation for these types.

@@ -254,9 +254,9 @@ Selected: z-ai/glm-5.2
 Answer: <model reply>
 ```
 
-With the optional tool-failure history, the selected model is `anthropic/claude-opus-4.8`. For routing only, keep the original `Done` arm. Other algorithms may supply an answer in `outcome.response`; the [general integration pattern](../README.md#start-with-libsy) shows how to reuse it.
+With the optional tool-failure history, the selected model is `anthropic/claude-opus-4.8`. For routing only, keep the original `Done` arm. Other algorithms may supply an answer in `outcome.response`; see [final outcome handling](mechanics_of_libsy.md#stepdone) for how to reuse it.
 
-Your client returns `switchyard_protocol::Response` and adapts errors to `libsy::Result`. The [optional Switchyard HTTP client](../crates/libsy-llm-client/README.md) provides translation, streaming, retries, and fallback. Use [`libsy::drive`](reference/host_integration.md#concurrent-calls-and-cancellation) for concurrent algorithms; this loop serves calls sequentially.
+Your client returns `switchyard_protocol::Response` and adapts errors to `libsy::Result`. The [optional Switchyard HTTP client](../crates/libsy-llm-client/README.md) provides translation, streaming, retries, and fallback. For concurrent algorithms, [poll the Step stream and call futures together](mechanics_of_libsy.md#control-how-work-runs); this loop serves calls sequentially.
 
 ## Next steps
 
