@@ -107,6 +107,7 @@ struct RouteConfig {
     reasoning: Option<bool>,
     vision: Option<bool>,
     algorithm: AlgorithmSpec,
+    infra: Option<libsy::InfraPolicy>,
 }
 
 struct TargetPromptPolicy {
@@ -125,6 +126,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let tool_calling = take_optional(&mut table, "tool_calling")?;
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
+        let infra = take_optional(&mut table, "infra")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -134,6 +136,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             reasoning,
             vision,
             algorithm,
+            infra,
         })
     }
 }
@@ -302,6 +305,19 @@ impl DeploymentConfig {
                 .algorithm
                 .build_with_runtime_models(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+            if let Some(infra) = &config.infra {
+                if !matches!(&config.algorithm, AlgorithmSpec::LlmClassifier { config }
+                    if matches!(config.mode, None | Some(crate::ClassifierMode::Capability))
+                        && config.escalation.is_none())
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name}: infra requires capability llm_classifier without escalation"
+                    )));
+                }
+                infra.validate().map_err(|error| {
+                    RunnerError::configuration_source(format!("route {route_name}: {error}"), error)
+                })?;
+            }
             if let AlgorithmSpec::Vgr { config: vgr } = &config.algorithm
                 && let Some(probe) =
                     self.build_model_properties_probe(&vgr.efficient_target, &clients)
@@ -328,7 +344,8 @@ impl DeploymentConfig {
                 responses_auxiliary_target,
                 decision_targets,
                 models,
-            );
+            )
+            .with_infra(config.infra.clone());
             routes.push((config.id.clone(), route));
         }
         let runner = Runner::new(routes)
@@ -1054,7 +1071,17 @@ efficient_target = "weak"
 
     #[test]
     fn public_runner_from_toml_builds_a_deployment() -> RunnerResult<()> {
-        let runner = Runner::from_toml(VALID_CONFIG)?;
+        let config = format!(
+            "{VALID_CONFIG}\n[routes.classifier.infra]\n\
+             max_signal_age_ms = 1000\nmin_waiting_requests = 4\nmax_capable_inflight = 2"
+        );
+        let runner = Runner::from_toml(&config)?;
+        assert!(
+            Runner::from_toml(
+                &config.replace("min_waiting_requests = 4", "min_waiting_requests = 0")
+            )
+            .is_err()
+        );
 
         let classifier = runner
             .route("switchyard/classifier")
