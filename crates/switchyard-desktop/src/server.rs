@@ -6,10 +6,15 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use switchyard_desktop::install::credentials::KeyStatus;
 
 use crate::config::Config;
+use crate::health::{Probe, ServerStatus};
+
+/// RESTART_WAIT limits how long the app waits for the restarted server to answer `/health`.
+const RESTART_WAIT: Duration = Duration::from_secs(10);
 
 /// This function finds the installed helper, which is the only program that reads or writes
 /// server keys.
@@ -43,10 +48,14 @@ fn key_command(args: &[&str], key: Option<&str>) -> Result<String, String> {
                 helper.display()
             )
         })?;
-    if let (Some(key), Some(mut stdin)) = (key, child.stdin.take()) {
-        stdin
-            .write_all(key.as_bytes())
-            .map_err(|error| format!("Could not pass the key to the helper: {error}"))?;
+    if let (Some(key), Some(mut stdin)) = (key, child.stdin.take())
+        && let Err(error) = stdin.write_all(key.as_bytes())
+    {
+        // The app tries to stop and reap the helper while preserving the original input error.
+        // Cleanup errors may occur if the helper already exited.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("Could not pass the key to the helper: {error}"));
     }
     let output = child
         .wait_with_output()
@@ -65,6 +74,18 @@ pub fn server_keys(settings: &Config) -> Result<Vec<KeyStatus>, String> {
     let config = std::fs::canonicalize(&settings.config_file).map_err(|error| error.to_string())?;
     let output = key_command(&["status", "--config", &config.display().to_string()], None)?;
     serde_json::from_str(&output).map_err(|error| error.to_string())
+}
+
+pub fn save_server_key(name: &str, key: &str) -> Result<(), String> {
+    key_command(&["set", name], Some(key)).map(drop)
+}
+
+pub fn import_server_key(name: &str) -> Result<(), String> {
+    key_command(&["import", name], None).map(drop)
+}
+
+pub fn remove_server_key(name: &str) -> Result<(), String> {
+    key_command(&["remove", name], None).map(drop)
 }
 
 /// This function finds the installed server from the app's installation metadata.
@@ -119,6 +140,55 @@ fn check(binary: &Path, config: &Path) -> Result<(), String> {
 
 pub fn check_config(settings: &Config) -> Result<(), String> {
     check(&server_binary()?, &settings.config_file)
+}
+
+pub fn restart_checked(settings: &Config) -> Result<String, String> {
+    check_config(settings)?;
+    restart(&settings.launchd_label)?;
+    if !wait_for_health(&settings.server_url) {
+        return Err(format!(
+            "Switchyard did not answer {}/health within {} seconds. Open the server log and retry.",
+            settings.server_url.trim_end_matches('/'),
+            RESTART_WAIT.as_secs()
+        ));
+    }
+    Ok("Restarted Switchyard.".into())
+}
+
+/// This function restarts the server's LaunchAgent, systemd user service, or Windows scheduled task.
+pub fn restart(launchd_label: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let _ = launchd_label;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let settings = switchyard_desktop::install::Settings::load(
+            &switchyard_desktop::install::bundle_metadata(&exe),
+        )?;
+        switchyard_desktop::install::windows::restart(&settings)
+    }
+    #[cfg(not(windows))]
+    {
+        if cfg!(target_os = "linux") {
+            return command("systemctl", &["--user", "restart", "switchyard.service"]).map(|_| ());
+        }
+        let uid = command("id", &["-u"])?;
+        let target = format!("gui/{}/{launchd_label}", uid.trim());
+        command("launchctl", &["kickstart", "-k", &target]).map(|_| ())
+    }
+}
+
+pub(crate) fn wait_for_health(server_url: &str) -> bool {
+    let deadline = Instant::now() + RESTART_WAIT;
+    let probe = Probe::default();
+    loop {
+        if probe.probe(server_url) == ServerStatus::Running {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// This function runs a command, returning its stdout or a message naming what failed.
