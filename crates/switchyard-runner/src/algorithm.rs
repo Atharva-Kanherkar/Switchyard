@@ -654,7 +654,11 @@ pub struct StageTierConfig {
     pub tool_semantics: ToolSemantics,
     /// Requests to keep on the capable tier after an escalation.
     #[serde(default)]
-    pub capable_hold_turns: Option<u32>,
+    pub capable_hold_turns: Option<i64>,
+    /// Requests to keep on efficient after a switch. Defaults to `-1` for
+    /// composite's capable-first policy, otherwise `0`. `-1` pins it.
+    #[serde(default)]
+    pub efficient_hold_turns: Option<i64>,
     /// Notes handed to a tier when the router switches to it.
     #[serde(default)]
     pub handoff_notes: Option<HandoffNoteConfig>,
@@ -1612,6 +1616,7 @@ fn build_algorithm(
                 recent_turn_window,
                 tool_semantics,
                 capable_hold_turns,
+                efficient_hold_turns,
                 handoff_notes,
                 ..
             } = tiers;
@@ -1632,6 +1637,7 @@ fn build_algorithm(
             if let Some(turns) = capable_hold_turns {
                 config.capable_hold_turns = *turns;
             }
+            config.efficient_hold_turns = *efficient_hold_turns;
             config.tool_semantics = tool_semantics.clone();
             config.handoff_notes = handoff_notes.clone();
             // The judge is called through its own target, so it is not a routing
@@ -1682,6 +1688,7 @@ fn build_algorithm(
             if let Some(turns) = stage.capable_hold_turns {
                 stage_config.capable_hold_turns = turns;
             }
+            stage_config.efficient_hold_turns = stage.efficient_hold_turns;
             stage_config.tool_semantics = stage.tool_semantics.clone();
             stage_config.handoff_notes = stage.handoff_notes.clone();
             let judge = if matches!(classifier.mode, Some(ClassifierMode::Custom)) {
