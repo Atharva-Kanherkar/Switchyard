@@ -51,9 +51,12 @@ discovery for those servers is not implemented.
 The judge reads its verdicts from the first token's logprobs, so its scored calls
 turn thinking off: they send `reasoning_effort = "none"` and
 `chat_template_kwargs = {"enable_thinking": false}` on `openai_chat` targets.
-Candidates and the judge's deliberation keep the target's own setting. A backend
-that rejects `chat_template_kwargs` can drop it with the target's
-`omit_body_fields`.
+Candidates and the judge's deliberation keep the target's own setting. If a Chat
+backend explicitly rejects this template switch with HTTP 400 or 422, the SDK
+retries once without it, within the same deadline. Other request fields and the
+configured transient retry budget are preserved. The target's `omit_body_fields`
+can omit the switch from the first call. Custom hosts must handle provider
+compatibility themselves.
 
 The server caches the model catalog, including unavailable discovery results,
 for one minute. Discovery probes run concurrently with a two-second total budget
@@ -129,6 +132,25 @@ providers:
 automatic continuations. Retries retain the original call's tag. Without a
 recognized tag, Switchyard uses the message shape to identify a user turn.
 `x-session-id` is also accepted as a session-header alias.
+
+## Served-answer reporting
+
+VGR opts into served-answer reporting through `Algorithm::tracks_answers`.
+The SDK summarizes answers only for opted-in algorithms with a session ID;
+other routers keep their responses and streams unchanged. Custom algorithms and
+classifiers default to no tracking. Stateful `FallThrough` routes opt in when a
+classifier requests reports.
+
+Custom libsy hosts can check `tracks_answers()` and report
+`AnswerSummary::of(&response)` through `Algorithm::observe_answer` for aggregate
+responses. For streams, report `final_reply = false` when serving begins and
+report the final summary before forwarding the terminal chunk. Use the request's
+session ID; requests without one retain the existing behavior.
+
+Without a recognized `x-initiator` header, reported incomplete answers and
+immediate recovery nudges retain the turn hold and budget. A reply to a complete
+final answer releases them after a two-second quiet period. Explicit user/agent
+headers take precedence. Hosts that omit reporting retain message-shape detection.
 
 ## Verification and capable-tier outages
 
