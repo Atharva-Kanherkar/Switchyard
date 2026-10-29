@@ -147,6 +147,14 @@ type ActionRow = (Tab, char, &'static str, &'static str, &'static [ActionKind]);
 const ACTIONS: &[ActionRow] = &[
     (
         Tab::Routes,
+        'e',
+        "preview",
+        "Checks the selected route's current algorithm and models against the server \
+         config and shows the notes. Nothing is saved.",
+        &[ActionKind::PreviewRoute],
+    ),
+    (
+        Tab::Routes,
         'm',
         "models",
         "Loads the model IDs that an endpoint offers.",
@@ -983,6 +991,29 @@ impl App {
                     "Type UPDATE to start",
                 )));
             }
+            (Some(ActionKind::PreviewRoute), Ok(reply)) => {
+                if !popup_matches {
+                    self.report(
+                        "The route preview finished while another window was open. \
+                         Press e on Routes to preview it again."
+                            .into(),
+                        Tone::Done,
+                        false,
+                    );
+                    return None;
+                }
+                let notes: Vec<&str> = reply.data["notes"]
+                    .as_array()
+                    .map(|items| items.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let file = reply.data["file"].as_str().unwrap_or_default();
+                self.set_popup(Some(Popup::Message {
+                    title: "Route preview",
+                    text: format!("Nothing was saved to {file}.\n\n{}", notes.join("\n")),
+                    tone: Tone::Done,
+                    scroll: 0,
+                }));
+            }
             (Some(ActionKind::Models), Ok(reply)) if popup_matches => {
                 let models: Vec<&str> = reply.data["models"]
                     .as_array()
@@ -1341,8 +1372,21 @@ impl App {
     /// that they do not know, so a new row must also be added to its arm.
     fn start_action(&mut self, kind: ActionKind, key: char) -> Result<Option<Request>, String> {
         let request = |action, label| Ok(Some(Request::run(action, label)));
-
+        let generation = self.data.generation;
         match kind {
+            ActionKind::PreviewRoute => {
+                let route = self.selected_route()?.clone();
+                request(
+                    Action::PreviewRoute {
+                        generation,
+                        route: route.key,
+                        algorithm: route.kind,
+                        choices: route.choices,
+                        revision: Some(route.revision),
+                    },
+                    "Previewing the route",
+                )
+            }
             ActionKind::Models => {
                 let client = self.data.clients.first();
                 let client = client.map(|c| c.name.clone()).unwrap_or_default();
@@ -1677,6 +1721,7 @@ fn block(theme: Theme, title: &str) -> Block<'static> {
 fn draw(frame: &mut Frame, app: &mut App) {
     // This exhaustive destructuring requires an update when Snapshot gains a field.
     let Snapshot {
+        generation: _,      // Each route form returns this value with its action.
         clients: _,         // draw_endpoints and the endpoint forms show these clients.
         algorithms: _,      // draw_routes and the algorithm fields show these algorithms.
         routes: _,          // draw_routes and the route details show these routes.
@@ -3713,6 +3758,40 @@ mod tests {
                 Some(_) => unreachable!(),
             }
         }
+    }
+
+    // A route preview that finishes after the user opens help must keep help open and still
+    // tell the user that the preview finished.
+    #[test]
+    fn late_route_previews_keep_the_new_popup_and_report_in_the_status_bar() {
+        let mut app = App::new(Theme::new(false));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let request = Request::run(
+            Action::PreviewRoute {
+                generation: 0,
+                route: "direct".into(),
+                algorithm: "passthrough".into(),
+                choices: Vec::new(),
+                revision: None,
+            },
+            "Previewing the route",
+        );
+        let (jobs, _inbox) = mpsc::channel();
+        let (done, results) = mpsc::channel();
+        app.start(&jobs, request).expect("start preview");
+        app.key(key(KeyCode::Char('?')));
+        done.send(Done::Finished {
+            reply: Some(Ok(super::Reply {
+                message: String::new(),
+                data: json!({"file": "server.toml", "notes": ["note"]}),
+            })),
+            snapshot: Ok(Box::new(Snapshot::default())),
+        })
+        .expect("preview result");
+        app.poll_results(&results, &jobs).expect("result");
+        assert!(matches!(app.popup, Some(Popup::Help { .. })));
+        let toast = app.toast.as_ref().expect("status message");
+        assert!(toast.text.contains("Press e on Routes"), "{}", toast.text);
     }
 
     // A snapshot failure must preserve a replacement draft and leave a dismissed popup closed.
