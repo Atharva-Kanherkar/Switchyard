@@ -418,6 +418,148 @@ impl ServerConfig {
             .collect()
     }
 
+    pub fn remove(&self, route: &str) -> Result<Edited, String> {
+        let mut doc = self.doc.clone();
+        let routes = doc
+            .get_mut("routes")
+            .and_then(Item::as_table_like_mut)
+            .ok_or("No routes are configured.")?;
+        let removed = routes
+            .remove(route)
+            .ok_or("The route was already removed. Refresh and choose it again.")?;
+        let emptied = routes.is_empty();
+        retain_block_markers(&mut doc, &removed);
+        // Files that use `[routes.name]` headers leave `[routes]` implicit, and an implicit table
+        // with no entries is not written. The server requires `routes`, so the last delete writes
+        // an explicit empty `[routes]` table.
+        if emptied && let Some(routes) = doc["routes"].as_table_mut() {
+            routes.set_implicit(false);
+        }
+        Ok(Edited {
+            text: doc.to_string(),
+            notes: vec![
+                "Removed the route. Its targets and endpoint settings are preserved.".into(),
+            ],
+        })
+    }
+
+    pub fn change_route(
+        &self,
+        operation: &str,
+        route: &str,
+        name: &str,
+        id: &str,
+        algorithm: Option<&Algorithm>,
+        choices: &[Choice],
+    ) -> Result<Edited, String> {
+        if id.trim().is_empty() || id.contains(['\n', '\r']) {
+            return Err("Enter a nonempty public route ID without line breaks.".into());
+        }
+        // A rename to the current ID would ask the user to save and restart for no change.
+        if operation == "rename"
+            && self
+                .routes()
+                .iter()
+                .any(|existing| existing.key == route && existing.id == id)
+        {
+            return Err("The route already uses that public ID.".into());
+        }
+        if self
+            .routes()
+            .iter()
+            .any(|existing| existing.id == id && !(operation == "rename" && existing.key == route))
+        {
+            return Err("That public route ID is already configured.".into());
+        }
+        let mut doc = self.doc.clone();
+        if operation == "rename" {
+            let table = doc
+                .get_mut("routes")
+                .and_then(Item::as_table_like_mut)
+                .and_then(|routes| routes.get_mut(route))
+                .and_then(Item::as_table_like_mut)
+                .ok_or("Choose an existing route.")?;
+            table.insert("id", toml_edit::value(id));
+            let mut notes = vec![
+                "Harnesses that select the old public route ID must choose the new ID.".into(),
+            ];
+            notes.extend(self.generated_note(route, &[]));
+            return Ok(Edited {
+                text: doc.to_string(),
+                notes,
+            });
+        }
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err("Route names need 1–64 letters, numbers, hyphens, or underscores.".into());
+        }
+        if self.route(name).is_some() {
+            return Err("That route name is already configured.".into());
+        }
+        let mut table = match operation {
+            "duplicate" => self
+                .table("routes")
+                .and_then(|routes| routes.get(route))
+                .cloned()
+                .ok_or("Choose an existing route.")?,
+            "create" => {
+                let mut table = toml_edit::Table::new();
+                table.insert("type", toml_edit::value("passthrough"));
+                table.insert("target", toml_edit::value(""));
+                Item::Table(table)
+            }
+            _ => return Err("Choose Create, Duplicate, or Rename.".into()),
+        };
+        let mut copied = vec![&mut table];
+        while let Some(item) = copied.pop() {
+            if let Some(table) = item.as_table_mut() {
+                table.set_position(Some(-1));
+                if let Some(prefix) = table.decor().prefix().and_then(|prefix| prefix.as_str()) {
+                    let prefix = prefix
+                        .split_inclusive('\n')
+                        .filter(|line| {
+                            !line.trim().starts_with("# >>>") && !line.trim().starts_with("# <<<")
+                        })
+                        .collect::<String>();
+                    table.decor_mut().set_prefix(prefix);
+                }
+                copied.extend(table.iter_mut().map(|(_, item)| item));
+            }
+        }
+        table
+            .as_table_like_mut()
+            .ok_or("Route must be a table.")?
+            .insert("id", toml_edit::value(id));
+        if doc.get("routes").is_none() {
+            doc["routes"] = Item::Table(toml_edit::Table::new());
+        }
+        doc["routes"]
+            .as_table_like_mut()
+            .ok_or("Routes must be a table.")?
+            .insert(name, table);
+        let candidate = ServerConfig::parse(&doc.to_string())?;
+        if operation == "create" {
+            candidate.edit(
+                name,
+                algorithm.ok_or("Choose a routing algorithm.")?,
+                choices,
+            )
+        } else {
+            Ok(Edited {
+                text: doc.to_string(),
+                notes: vec![
+                    "The duplicate initially shares targets and endpoint settings \
+                     with the source route."
+                        .into(),
+                ],
+            })
+        }
+    }
+
     pub fn clients(&self) -> Vec<Client> {
         entries(self.table("llm_clients"))
             .map(|(name, client)| Client {
@@ -1105,6 +1247,67 @@ fn login_hosts<'c>(clients: &'c [Client], choices: &[Choice]) -> Vec<&'c str> {
     hosts
 }
 
+// Generated-block markers can occur on nested route tables and still apply to retained targets.
+// Only the marker lines move to the next table; other comments describe the removed route and
+// leave with it.
+fn retain_block_markers(doc: &mut DocumentMut, removed: &Item) {
+    let mut markers = Vec::new();
+    let mut tables: Vec<_> = removed.as_table().into_iter().collect();
+    while let Some(table) = tables.pop() {
+        if let Some(position) = table.position()
+            && let Some(prefix) = table.decor().prefix().and_then(|value| value.as_str())
+        {
+            let kept: String = prefix
+                .split_inclusive('\n')
+                .filter(|line| line.trim().starts_with("# >>>") || line.trim().starts_with("# <<<"))
+                .collect();
+            if !kept.is_empty() {
+                markers.push((position, kept));
+            }
+        }
+        tables.extend(table.iter().filter_map(|(_, item)| item.as_table()));
+    }
+    markers.sort_by_key(|(position, _)| *position);
+    let mut positions = Vec::new();
+    let mut tables = vec![doc.as_table()];
+    while let Some(table) = tables.pop() {
+        positions.extend(table.position());
+        tables.extend(table.iter().filter_map(|(_, item)| item.as_table()));
+    }
+    let mut prefixes: HashMap<isize, String> = HashMap::new();
+    let mut trailing = String::new();
+    for (removed_position, prefix) in markers {
+        if let Some(next) = positions
+            .iter()
+            .copied()
+            .filter(|position| *position > removed_position)
+            .min()
+        {
+            prefixes.entry(next).or_default().push_str(&prefix);
+        } else {
+            trailing.push_str(&prefix);
+        }
+    }
+    let mut tables = vec![doc.as_table_mut()];
+    while let Some(table) = tables.pop() {
+        if let Some(position) = table.position()
+            && let Some(mut prefix) = prefixes.remove(&position)
+        {
+            prefix.push_str(
+                table
+                    .decor()
+                    .prefix()
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default(),
+            );
+            table.decor_mut().set_prefix(prefix);
+        }
+        tables.extend(table.iter_mut().filter_map(|(_, item)| item.as_table_mut()));
+    }
+    trailing.push_str(doc.trailing().as_str().unwrap_or_default());
+    doc.set_trailing(trailing);
+}
+
 /// This function finds the route and target tables that sit inside blocks another tool
 /// writes. A block starts at a line that begins with `# >>>` and ends at the
 /// next line that begins with `# <<<`, the markers that the installer scripts
@@ -1142,4 +1345,33 @@ fn table_key(path: &str) -> Option<&str> {
         return quoted.split_once('"').map(|(key, _)| key);
     }
     path.split(['.', ']']).next().filter(|key| !key.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `[routes.name]` headers leave `[routes]` implicit. Deleting the last route must still
+    // write a `routes` table, or the server rejects the file with `missing field routes`.
+    #[test]
+    fn deleting_the_last_route_keeps_an_empty_routes_table() {
+        let config = ServerConfig::parse(
+            "schema_version = 1\n\
+             [llm_clients.c]\n\
+             format = 'openai_chat'\n\
+             base_url = 'https://example.test/v1'\n\
+             [targets.m]\n\
+             id = 'model'\n\
+             llm_client = 'c'\n\
+             [routes.only]\n\
+             id = 'only'\n\
+             type = 'passthrough'\n\
+             target = 'm'\n",
+        )
+        .expect("config");
+        let edited = config.remove("only").expect("remove");
+        let routes = switchyard_runner::route_targets(&edited.text)
+            .unwrap_or_else(|error| panic!("{error}\n{}", edited.text));
+        assert!(routes.is_empty(), "{}", edited.text);
+    }
 }
