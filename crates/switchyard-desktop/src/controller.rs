@@ -17,6 +17,14 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[strum_discriminants(name(ActionKind), derive(strum::EnumIter))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
+    Models {
+        client: String,
+        refresh: bool,
+        key: Option<String>,
+        /// This field holds the endpoint's base URL when the user opened the key form. The
+        /// controller refuses `key` unless the endpoint still has this URL.
+        base_url: Option<String>,
+    },
     Restart {},
     PreviewUpdate {},
     Update {
@@ -117,6 +125,8 @@ pub struct RouteInfo {
 #[derive(Clone, Default, Serialize)]
 pub struct ClientInfo {
     pub name: String,
+    /// This field holds the URL that the app sends a model-list key to.
+    pub base_url: String,
     pub host: String,
     /// This field lists the model IDs that targets in the server config name on this endpoint.
     pub models: Vec<String>,
@@ -283,6 +293,12 @@ impl Controller {
             ))
         }
     }
+    fn routes(&self) -> Result<ServerConfig, String> {
+        let text = std::fs::read_to_string(&self.config.config_file).map_err(|e| e.to_string())?;
+        ServerConfig::parse(&text).map_err(|_| {
+            "The server config contains invalid TOML. Open it in Settings to fix it.".into()
+        })
+    }
     // Unchanged bytes keep the draft revision when the editor switches algorithms.
     fn remember_route(&mut self, route: &str, mut review: Review) -> String {
         if let Some(previous) = self.route_reviews.get(route)
@@ -325,6 +341,7 @@ impl Controller {
             .iter()
             .map(|c| ClientInfo {
                 name: c.name.clone(),
+                base_url: c.base_url.clone(),
                 host: c.host().to_string(),
                 models: config.models_on(&c.name),
                 unlisted: models::unlisted(c),
@@ -541,6 +558,70 @@ impl Controller {
             Action::OpenLogs {} => {
                 server::command("open", &[&logs_dir()?.display().to_string()])?;
                 Ok(Reply::message("Opened Switchyard logs.".into()))
+            }
+            Action::Models {
+                client,
+                refresh,
+                key,
+                base_url,
+            } => {
+                let config = self.routes()?;
+                let client = config
+                    .clients()
+                    .into_iter()
+                    .find(|c| c.name == client)
+                    .ok_or("Unknown endpoint.")?;
+                if let Some(key) = &key {
+                    if key.trim().is_empty() || models::has_line_break(key) {
+                        return Err("Enter a nonempty key without line breaks.".into());
+                    }
+                    if base_url.as_deref() != Some(client.base_url.as_str()) {
+                        return Err(format!(
+                            "The URL for {} changed after this form opened, so the app did \
+                             not send the key. Open the form again to check the endpoint.",
+                            client.name
+                        ));
+                    }
+                    if models::unlisted(&client)
+                        || !(client.forward_auth || client.api_key_env.is_some())
+                    {
+                        return Err("This endpoint does not accept a model-list key. \
+                                    Choose an endpoint configured for model-list authentication."
+                            .into());
+                    }
+                    #[cfg(not(any(target_os = "macos", windows)))]
+                    models::save_key(&client.base_url, key)?;
+                }
+                let cache = self.settings.with_file_name(models::CACHE_FILE);
+                let loaded =
+                    models::load(&cache, &client, refresh || key.is_some(), key.as_deref());
+                if let Some(key) = &key {
+                    match &loaded.error {
+                        None | Some(models::ListError::NotCached(_)) => {
+                            models::save_key(&client.base_url, key)?
+                        }
+                        Some(error) => return Err(error.reason()),
+                    }
+                }
+                // Fetch and cache-write failures need a warning even when a model list remains usable.
+                let warning = loaded.error.is_some();
+                let fetched_at = loaded.list.as_ref().map(|list| list.fetched_at);
+                let source = loaded.list.as_ref().map_or("config", |_| loaded.source);
+                let message = loaded
+                    .error
+                    .map(|e| match e.advice() {
+                        "" => e.reason(),
+                        advice => format!("{} {advice}", e.reason()),
+                    })
+                    .unwrap_or_else(|| "Model list loaded.".into());
+                let models = loaded
+                    .list
+                    .map(|l| l.models)
+                    .unwrap_or_else(|| config.models_on(&client.name));
+                Ok(Reply {
+                    message,
+                    data: json!({"client":client.name,"count":models.len(),"models":models,"warning":warning,"source":source,"fetched_at":fetched_at}),
+                })
             }
             Action::Restart {} => server::restart_checked(&self.config).map(Reply::message),
             Action::CheckConfig {} => server::check_config(&self.config)
@@ -837,5 +918,39 @@ policy = { type = "target_selector", selector = "/target" }
             "{:?}",
             snapshot.errors
         );
+    }
+
+    // The key form keeps the URL it opened with. If the server config moves the endpoint
+    // before the user submits, the controller must not send the key to the new URL.
+    #[test]
+    fn model_keys_go_only_to_the_url_the_form_opened_with() {
+        let directory = tempfile::tempdir().expect("directory");
+        let settings = directory.path().join("desktop.toml");
+        let server_config = directory.path().join("server.toml");
+        std::fs::write(
+            &settings,
+            format!("server_url = 'http://127.0.0.1:9'\nconfig_file = {server_config:?}\n"),
+        )
+        .expect("settings");
+        std::fs::write(
+            &server_config,
+            "schema_version = 1\n\n[llm_clients.primary]\nformat = \"openai_chat\"\n\
+             base_url = \"https://new.example.test/v1\"\napi_key_env = \"PRIMARY_KEY\"\n",
+        )
+        .expect("server config");
+        let config = Config::load(&settings).expect("config");
+        let mut controller = Controller::new(config, settings);
+        for base_url in [Some("https://old.example.test/v1".to_string()), None] {
+            let error = controller
+                .dispatch(Action::Models {
+                    client: "primary".into(),
+                    refresh: true,
+                    key: Some("secret".into()),
+                    base_url,
+                })
+                .err()
+                .expect("the URL changed");
+            assert!(error.starts_with("The URL for primary changed"), "{error}");
+        }
     }
 }
