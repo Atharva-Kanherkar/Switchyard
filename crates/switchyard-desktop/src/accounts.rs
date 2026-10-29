@@ -26,6 +26,19 @@ fn root(tool: Harness) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+pub fn validate(tool: Harness, path: &Path) -> Result<(), String> {
+    let root = root(tool)?;
+    if path.parent() != Some(root.as_path())
+        || !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        return Err(format!(
+            "{} is not a saved account folder. Choose an account folder that exists and is not a symlink.",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 pub fn discover(tool: Harness) -> Result<Vec<(String, PathBuf)>, String> {
     if !matches!(tool, Harness::CodexCli | Harness::Claude) {
         return Ok(Vec::new());
@@ -59,6 +72,10 @@ pub fn discover(tool: Harness) -> Result<Vec<(String, PathBuf)>, String> {
     }
     accounts.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(accounts)
+}
+
+pub fn list(tool: Harness) -> Vec<(String, PathBuf)> {
+    discover(tool).unwrap_or_default()
 }
 
 pub fn config_paths(tool: Harness, account: Option<&Path>) -> Result<Vec<PathBuf>, String> {
