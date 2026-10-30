@@ -379,6 +379,14 @@ impl SubagentRouteConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanExecuteTrigger {
+    #[default]
+    Edit,
+    Judge,
+}
+
 /// A routing algorithm described by configured target names. Converting it to `&str` gives
 /// the route's `type`, such as `stage_router`.
 #[derive(Clone, Debug, Deserialize, IntoStaticStr)]
@@ -404,11 +412,14 @@ pub enum AlgorithmSpec {
         #[serde(default)]
         subagents: Option<SubagentRouteConfig>,
     },
-    /// Plans on the capable target, then permanently hands off after the first mutation.
+    /// Plans on the capable target, then hands off after an edit or judge approval.
     PlanExecute {
-        /// Target used before the first edit or write.
+        #[serde(default)]
+        execution_trigger: PlanExecuteTrigger,
+        judge: Option<StageClassifierConfig>,
+        /// Target used before handoff.
         capable_target: String,
-        /// Target used from the first edit or write onward.
+        /// Target used after handoff.
         efficient_target: String,
         /// Additional tool names whose mutations trigger handoff.
         #[serde(default)]
@@ -842,7 +853,10 @@ impl AlgorithmSpec {
                 Some((classifier.target.as_str(), classifier.decision.as_ref())),
                 [efficient.as_deref(), capable.as_deref()],
             ),
-            Self::StageRouter { classifier, .. } => (
+            Self::PlanExecute {
+                judge: classifier, ..
+            }
+            | Self::StageRouter { classifier, .. } => (
                 classifier
                     .as_ref()
                     .map(|c| (c.target.as_str(), c.decision.as_ref())),
@@ -972,7 +986,7 @@ impl AlgorithmSpec {
                     names.push(config.classifier_target.as_str());
                 }
             }
-            Self::StageRouter { .. } | Self::Composite { .. } => {
+            Self::PlanExecute { .. } | Self::StageRouter { .. } | Self::Composite { .. } => {
                 names.extend(self.classifier_targets().map(|(target, _)| target));
             }
             Self::Advisor { advisor_target, .. } => names.push(advisor_target),
@@ -1011,22 +1025,16 @@ impl AlgorithmSpec {
             Self::Passthrough { target, .. } => {
                 category_models([(Category::Any, vec![target.clone()])])
             }
-            Self::PlanExecute {
-                capable_target,
-                efficient_target,
-                ..
-            } => category_models([
-                (Category::Capable, vec![capable_target.clone()]),
-                (Category::Efficient, vec![efficient_target.clone()]),
-                (
-                    Category::Any,
-                    vec![capable_target.clone(), efficient_target.clone()],
-                ),
-            ]),
             Self::LlmClassifier { config } => {
                 classifier_runtime_model_names(config.validated_classifier_mode(route_name)?)
             }
-            Self::StageRouter {
+            Self::PlanExecute {
+                capable_target,
+                efficient_target,
+                judge: classifier,
+                ..
+            }
+            | Self::StageRouter {
                 capable_target,
                 efficient_target,
                 classifier,
@@ -1636,13 +1644,42 @@ fn build_algorithm(
             attach_subagent_router(route_name, parent, subagents.as_ref(), targets)
         }
         AlgorithmSpec::PlanExecute {
+            execution_trigger,
+            judge,
+            capable_target,
+            efficient_target,
             tool_semantics,
             planning_prompt,
             handoff_prompt,
             planner_reasoning_as_text,
             ..
         } => {
-            let mut config = PlanExecuteConfig::default();
+            if (*execution_trigger == PlanExecuteTrigger::Judge) != judge.is_some() {
+                return Err(AlgorithmConfigError::new(
+                    "plan_execute requires a judge exactly when execution_trigger = judge",
+                ));
+            }
+            let mut config = PlanExecuteConfig {
+                judge: judge
+                    .as_ref()
+                    .map(|judge| {
+                        if judge.classify_trigger != ClassifyTrigger::EveryRequest
+                            || judge.message_hash_fallback
+                        {
+                            return Err(AlgorithmConfigError::new(
+                                "plan_execute judge runs every tool turn. Remove classify_trigger and message_hash_fallback",
+                            ));
+                        }
+                        judge.task_classifier_config(
+                            route_name,
+                            capable_target,
+                            efficient_target,
+                            targets,
+                        )
+                    })
+                    .transpose()?,
+                ..PlanExecuteConfig::default()
+            };
             config.tool_semantics.clone_from(tool_semantics);
             if let Some(prompt) = planning_prompt {
                 config.planning_prompt = prompt.clone();
