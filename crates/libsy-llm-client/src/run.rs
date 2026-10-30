@@ -64,7 +64,9 @@ pub async fn run(
     // This says if we have an observer, put Some(..) in routing_observations.
     // No observer means we don't want any routing_observations.
     let routing_observations = observer.as_ref().map(|_| Arc::new(Mutex::new(Vec::new())));
-    let outcome = match clients.stored_state_owner(&request) {
+    let stored = clients.stored_state_owner(&request);
+    let parent = stored.as_ref().and_then(|owner| owner.history.clone());
+    let outcome = match stored {
         Some(owner) => Ok(continue_on(owner, &algorithm_name, request)),
         None => {
             drive(algorithm, request, models, {
@@ -91,7 +93,7 @@ pub async fn run(
         observer(RunObservation::Outcome(metadata));
     }
     let result = if let Some(response) = outcome.response {
-        let result = clients.remember_state_owner(&outcome.request, response);
+        let result = clients.remember_state_owner(&outcome.request, parent, response);
         let served_model = result
             .as_ref()
             .ok()
@@ -113,7 +115,7 @@ pub async fn run(
             &observe,
         )
         .await
-        .and_then(|response| clients.remember_state_owner(&outcome.request, response))
+        .and_then(|response| clients.remember_state_owner(&outcome.request, parent, response))
     };
     if let Some(observer) = &observer {
         observer(RunObservation::RoutingOverhead(overhead));
@@ -132,7 +134,9 @@ pub async fn decide(
     models: Arc<RuntimeModels>,
 ) -> Result<RoutingOutcome> {
     let routing_clients = clients.clone();
-    let mut outcome = match clients.stored_state_owner(&request) {
+    let stored = clients.stored_state_owner(&request);
+    let parent = stored.as_ref().and_then(|owner| owner.history.clone());
+    let mut outcome = match stored {
         Some(owner) => continue_on(owner, algorithm.name(), request),
         None => {
             drive(algorithm, request, models, move |call| {
@@ -145,7 +149,7 @@ pub async fn decide(
     outcome.request = clients.prepare_completion_request(outcome.request, &selected_model_id);
     outcome.response = outcome
         .response
-        .map(|response| clients.remember_state_owner(&outcome.request, response))
+        .map(|response| clients.remember_state_owner(&outcome.request, parent, response))
         .transpose()?;
     Ok(outcome)
 }
@@ -490,6 +494,7 @@ impl StateKey {
 }
 
 impl StateOwners {
+    #[cfg(test)]
     fn owner(&self, id: &str) -> Option<&StoredState> {
         self.owner_for_session(id, None)
     }
@@ -727,22 +732,11 @@ impl ClientRouter {
         })
     }
 
-    fn canonical_input(&self, request: &Request) -> CanonicalInput {
-        let fields = &request.llm_request.extensions.fields;
-        let owners = self.inner.state_owners.lock();
-        let parent = if let Some(id) = fields.get("previous_response_id").and_then(Value::as_str) {
-            owners.owner(id).and_then(|state| state.history.clone())
-        } else {
-            conversation_id(fields).and_then(|id| {
-                let session_id = request
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.session_id.as_deref());
-                owners
-                    .owner_for_session(id, session_id)
-                    .and_then(|state| state.history.clone())
-            })
-        };
+    /// Split `request` into the history it continued from and its new messages.
+    ///
+    /// `parent` is the history read before the model call. Reading the conversation again here
+    /// could pick up a concurrent turn and mix or drop messages.
+    fn canonical_input(request: &Request, parent: Option<Arc<MessageHistory>>) -> CanonicalInput {
         let parent_len = parent.as_ref().map_or(0, |history| history.len);
         let (parent, messages) = match request.llm_request.messages.get(parent_len..) {
             Some(messages) => (parent, messages.to_vec()),
@@ -755,7 +749,14 @@ impl ClientRouter {
     }
 
     /// Record provider-owned Responses state or canonical history for a cross-format response.
-    fn remember_state_owner(&self, request: &Request, mut response: Response) -> Result<Response> {
+    ///
+    /// `parent` is the canonical history `request` was materialized from, if any.
+    fn remember_state_owner(
+        &self,
+        request: &Request,
+        parent: Option<Arc<MessageHistory>>,
+        mut response: Response,
+    ) -> Result<Response> {
         let Some(model) = response.served_model().cloned() else {
             return Ok(response);
         };
@@ -777,7 +778,7 @@ impl ClientRouter {
         if !responses_request && !self.inner.track_provider_state {
             return Ok(response);
         }
-        let canonical_input = responses_request.then(|| self.canonical_input(request));
+        let canonical_input = responses_request.then(|| Self::canonical_input(request, parent));
         response.llm_response = match response.llm_response {
             LlmResponse::Agg(agg) => {
                 if let Some(body) = agg.preservation.responses.get(&responses_format) {
@@ -1680,7 +1681,7 @@ mod tests {
             },
         ]);
         response.set_served_model(&ModelId::from("weak"));
-        let response = clients.remember_state_owner(&seed, response)?;
+        let response = clients.remember_state_owner(&seed, None, response)?;
 
         let follow = |field: &str, value: Value| {
             let mut follow = request();
@@ -1769,7 +1770,7 @@ mod tests {
             upstream_headers: http::HeaderMap::new(),
         };
         response.set_served_model(&ModelId::from("weak"));
-        clients.remember_state_owner(&seed, response)?;
+        clients.remember_state_owner(&seed, None, response)?;
 
         let mut follow = request();
         follow
@@ -1819,7 +1820,7 @@ mod tests {
             upstream_headers: http::HeaderMap::new(),
         };
         buffered.set_served_model(&model);
-        clients.remember_state_owner(&request, buffered)?;
+        clients.remember_state_owner(&request, None, buffered)?;
 
         let mut streamed = stream_response(vec![
             LlmResponseChunk::MessageStart {
@@ -1836,7 +1837,7 @@ mod tests {
         ]);
         streamed.set_served_model(&model);
         clients
-            .remember_state_owner(&request, streamed)?
+            .remember_state_owner(&request, None, streamed)?
             .llm_response
             .into_agg()
             .await
@@ -1989,6 +1990,100 @@ mod tests {
             requests[2].llm_request.messages[2].content.as_slice(),
             [ContentBlock::Text { text }] if text == "session-a follow-up"
         ));
+        Ok(())
+    }
+
+    /// Holds its first call until the test releases it.
+    struct GatedClient {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        requests: Mutex<Vec<Request>>,
+    }
+
+    #[async_trait]
+    impl RoutedLlmClient for GatedClient {
+        async fn call(&self, request: Request) -> std::result::Result<Response, LlmClientError> {
+            let call = {
+                let mut requests = self.requests.lock();
+                requests.push(request);
+                requests.len()
+            };
+            if call == 1 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Response {
+                llm_response: LlmResponse::Agg(text_response(None, format!("reply {call}"))),
+                metadata: None,
+                upstream_headers: http::HeaderMap::new(),
+            })
+        }
+    }
+
+    // A turn saves against the history it was sent with, even when another turn on the same
+    // conversation finishes while its model call is in flight.
+    #[tokio::test]
+    async fn concurrent_conversation_turns_keep_their_own_history() -> Result<()> {
+        let client = Arc::new(GatedClient {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let clients = ClientRouter::new(HashMap::from([(
+            ModelId::from("strong"),
+            client.clone() as Arc<dyn RoutedLlmClient>,
+        )]));
+        let models = to_category_map(&["strong"]);
+        let make_request = |input: Value| -> Result<Request> {
+            Ok(Request {
+                llm_request: switchyard_translation::decode_request(
+                    WireFormat::OpenAiResponses,
+                    &json!({"model": "route", "input": input, "conversation": "conv_race"}),
+                )
+                .map_err(|error| LibsyError::external("decoding conversation request", error))?,
+                raw_request: None,
+                metadata: None,
+            })
+        };
+        let run_turn = |request| {
+            run(
+                Arc::new(switchyard_libsy::Passthrough),
+                clients.clone(),
+                request,
+                models.clone(),
+                None,
+            )
+        };
+
+        let first = run_turn(make_request(json!([
+            {"role": "user", "content": "first a"},
+            {"role": "assistant", "content": "first b"},
+            {"role": "user", "content": "first c"}
+        ]))?);
+        let second_request = make_request(json!("second"))?;
+        let second = async {
+            client.entered.notified().await;
+            let result = run_turn(second_request).await;
+            client.release.notify_one();
+            result
+        };
+        let (first, second) = tokio::join!(first, second);
+        first?;
+        second?;
+        run_turn(make_request(json!("next"))?).await?;
+
+        let requests = client.requests.lock();
+        let texts = requests[2]
+            .llm_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["first a", "first b", "first c", "reply 1", "next"]);
         Ok(())
     }
 
