@@ -16,7 +16,7 @@ use crate::history::Entry;
 use crate::pricing::Estimate;
 use crate::rollup::{CLASSIFIER_TIER, ModelTokens, Totals, Usage};
 use crate::server_config::Choice;
-use crate::summary::{money, tokens};
+use crate::summary::{grouped, hidden_savings, money, plural, tokens};
 use chrono::{DateTime, Utc};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -376,6 +376,20 @@ const ACTIONS: &[ActionRow] = &[
     ),
     (
         Tab::Settings,
+        'f',
+        "Change configuration",
+        "Selects the server config, address, log, and price file. Existing files are preserved.",
+        &[ActionKind::SaveConfiguration],
+    ),
+    (
+        Tab::Settings,
+        'd',
+        "Remove app preferences",
+        "Reviews removal of app preferences and keeps a recovery copy. Server configs and history are preserved.",
+        &[ActionKind::PreviewResetSettings, ActionKind::ResetSettings],
+    ),
+    (
+        Tab::Settings,
         'p',
         "Open model prices",
         "Opens the custom price file in $VISUAL or $EDITOR. With bundled prices, this explains \
@@ -601,6 +615,7 @@ impl Period {
 }
 
 enum FormKind {
+    Configuration,
     Preferences,
     SaveKey,
     ImportKey,
@@ -810,6 +825,34 @@ impl Form {
             }
         };
         Ok(Submit::Run(match &self.kind {
+            FormKind::Configuration => {
+                let saved = data
+                    .settings
+                    .as_ref()
+                    .ok_or("App settings are unavailable.")?;
+                let create_server = match self.value(6).as_str() {
+                    "yes" => true,
+                    "no" => false,
+                    _ => return Err("Enter yes or no for creating a server config.".into()),
+                };
+                Action::SaveConfiguration {
+                    config: crate::config::Config {
+                        server_url: self.value(0),
+                        config_file: self.value(1).into(),
+                        routing_log: self.value(2).into(),
+                        prices_file: (!self.value(3).is_empty()).then(|| self.value(3).into()),
+                        launchd_label: saved.launchd_label.clone(),
+                        baseline_model: self.value(4),
+                        refresh_seconds: self
+                            .value(5)
+                            .parse()
+                            .map_err(|_| "Enter a whole refresh interval in seconds.")?,
+                        // Config::load sets this from install.toml when the controller reloads.
+                        service_config: None,
+                    },
+                    create_server,
+                }
+            }
             FormKind::Preferences => Action::SavePreferences {
                 baseline_model: self.value(0),
                 refresh_seconds: self.value(1).parse().map_err(|_| {
@@ -976,6 +1019,7 @@ impl Form {
     }
     fn label(&self) -> &'static str {
         match &self.kind {
+            FormKind::Configuration => "Saving the configuration",
             FormKind::Preferences => "Saving the preferences",
             FormKind::SaveKey => "Saving the server key",
             FormKind::ImportKey => "Importing the server key",
@@ -1075,6 +1119,7 @@ fn route_models_form(
 fn reviewed(previewed: Action, preview: &Value) -> Option<Action> {
     let preview_token = preview["preview_token"].as_str().map(str::to_owned);
     Some(match previewed {
+        Action::PreviewResetSettings {} => Action::ResetSettings { preview_token },
         Action::PreviewRoute {
             generation,
             route,
@@ -1604,6 +1649,7 @@ impl App {
                     .selected_entry()
                     .filter(|_| self.selected > 0)
                     .map(|entry| (entry.ts.clone(), entry.model.clone(), entry.turn_id.clone()));
+                let initial = self.refreshed.is_none();
                 let route = self.selected_route_key();
                 let managed = self.session_id().ok();
                 self.data = *data;
@@ -1617,6 +1663,12 @@ impl App {
                 self.refreshed = Some(Instant::now());
                 self.rebuild_calls();
                 self.rebuild_routes(route);
+                if initial && (self.data.needs_setup || self.data.configuration_error.is_some()) {
+                    self.tab = Tab::Settings;
+                    if self.data.needs_setup {
+                        let _ = self.start_action(ActionKind::SaveConfiguration, 'f');
+                    }
+                }
                 if let Some((ts, model, turn)) = anchor
                     && let Some(position) = self.visible.iter().position(|&index| {
                         let entry = &self.data.entries[index];
@@ -1811,6 +1863,25 @@ impl App {
                         FormKind::Confirm("LAUNCH".into(), Box::new(launch)),
                         "Start this session?",
                         "Type LAUNCH to start it",
+                    )));
+                }
+            }
+            (Some(ActionKind::PreviewResetSettings), Ok(reply)) if popup_matches => {
+                if let Some(remove) = action.and_then(|action| reviewed(action, &reply.data)) {
+                    self.set_popup(Some(Popup::review(
+                        vec![
+                            Line::from(
+                                reply.data["message"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            ),
+                            Line::from(reply.data["file"].as_str().unwrap_or_default().to_string()),
+                        ],
+                        "Remove",
+                        FormKind::Confirm("REMOVE".into(), Box::new(remove)),
+                        "Remove app preferences?",
+                        "Type REMOVE to keep a recovery copy and remove preferences",
                     )));
                 }
             }
@@ -2450,6 +2521,46 @@ impl App {
             ActionKind::OpenSettings => {
                 request(Action::OpenSettings {}, "Opening the app settings")
             }
+            ActionKind::SaveConfiguration => {
+                let saved = self
+                    .data
+                    .settings
+                    .as_ref()
+                    .ok_or("App settings are unavailable.")?;
+                self.open(Form::new(
+                    FormKind::Configuration,
+                    "Switchyard configuration",
+                    vec![
+                        ("Server address", saved.server_url.clone()),
+                        (
+                            "Server config file",
+                            saved.config_file.display().to_string(),
+                        ),
+                        ("Routing log file", saved.routing_log.display().to_string()),
+                        (
+                            "Price override (optional)",
+                            saved
+                                .prices_file
+                                .as_ref()
+                                .map(|file| file.display().to_string())
+                                .unwrap_or_default(),
+                        ),
+                        ("Baseline model ID", saved.baseline_model.clone()),
+                        (
+                            "Refresh interval in seconds",
+                            saved.refresh_seconds.to_string(),
+                        ),
+                        (
+                            "Create server config? yes/no",
+                            if self.data.needs_setup { "yes" } else { "no" }.into(),
+                        ),
+                    ],
+                ))
+            }
+            ActionKind::PreviewResetSettings | ActionKind::ResetSettings => request(
+                Action::PreviewResetSettings {},
+                "Reviewing app preference removal",
+            ),
             ActionKind::SavePreferences => {
                 let (baseline, refresh) = self
                     .data
@@ -2613,22 +2724,6 @@ fn matches_words(fields: &[&str], filter: &str) -> bool {
     })
 }
 
-fn count(value: u64) -> String {
-    let digits = value.to_string();
-    let mut text = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            text.push(',');
-        }
-        text.push(digit);
-    }
-    text
-}
-
-fn plural(value: u64, one: &str, many: &str) -> String {
-    format!("{} {}", count(value), if value == 1 { one } else { many })
-}
-
 /// Single calls often cost fractions of a cent, so `call_money` shows more digits than `money`.
 fn call_money(usd: f64) -> String {
     if usd == 0.0 {
@@ -2673,24 +2768,6 @@ fn saved(theme: Theme, estimate: &Estimate, baseline: bool) -> Vec<Span<'static>
         spans.push(Span::styled(text, theme.muted));
     }
     spans
-}
-
-/// This function explains why `Estimate::savings` has no figure, in the order that
-/// `summary::build` checks the reasons. Call it only when the savings are hidden.
-fn hidden_savings(estimate: &Estimate, baseline: &str) -> String {
-    if estimate.baseline.is_none() {
-        format!("the price table has no rates for {baseline}")
-    } else if estimate.unknown_calls > 0 {
-        format!(
-            "{} no recorded cost",
-            plural(estimate.unknown_calls, "call has", "calls have")
-        )
-    } else {
-        format!(
-            "{} no token counts",
-            plural(estimate.uncounted_answers, "answer has", "answers have")
-        )
-    }
 }
 
 fn age(ts: &str, now: DateTime<Utc>) -> String {
@@ -2779,26 +2856,28 @@ fn block(theme: Theme, title: &str) -> Block<'static> {
 fn draw(frame: &mut Frame, app: &mut App) {
     // This exhaustive destructuring requires an update when Snapshot gains a field.
     let Snapshot {
-        tools: _,           // draw_harnesses and harness_lines show these tools.
-        generation: _,      // Each route form returns this value with its action.
-        clients: _,         // draw_endpoints and the endpoint forms show these clients.
-        algorithms: _,      // draw_routes and the algorithm fields show these algorithms.
-        routes: _,          // draw_routes and the route details show these routes.
-        update_status: _,   // draw_settings shows the last update status.
-        settings: _,        // draw_settings shows the app settings.
-        data_state: _,      // draw_overview shows health; draw_models checks usage
-        metrics: _,         // draw_header and the Overview cards
-        today: _,           // the Overview "Today" card title
-        analytics: _,       // draw_top_models and draw_models
-        estimates: _,       // the Overview cards, draw_top_models, and draw_models
-        baseline_model: _,  // draw_top_models and draw_models
-        activity: _,        // draw_activity
-        sessions: _,        // The Calls title and the `s` key use these IDs.
-        entries: _,         // draw_call_table and the call details show these entries.
-        skipped: _,         // calls_block shows the number of unreadable records.
-        limited: _,         // calls_block and draw_activity show this limit.
-        errors: _,          // draw_errors
-        refresh_seconds: _, // App::refresh_due
+        needs_setup: _,         // The Settings page and initial form show setup.
+        configuration_error: _, // The Settings page shows configuration errors.
+        tools: _,               // draw_harnesses and harness_lines show these tools.
+        generation: _,          // Each route form returns this value with its action.
+        clients: _,             // draw_endpoints and the endpoint forms show these clients.
+        algorithms: _,          // draw_routes and the algorithm fields show these algorithms.
+        routes: _,              // draw_routes and the route details show these routes.
+        update_status: _,       // draw_settings shows the last update status.
+        settings: _,            // draw_settings shows the app settings.
+        data_state: _,          // draw_overview shows health; draw_models checks usage
+        metrics: _,             // draw_header and the Overview cards
+        today: _,               // the Overview "Today" card title
+        analytics: _,           // draw_top_models and draw_models
+        estimates: _,           // the Overview cards, draw_top_models, and draw_models
+        baseline_model: _,      // draw_top_models and draw_models
+        activity: _,            // draw_activity
+        sessions: _,            // The Calls title and the `s` key use these IDs.
+        entries: _,             // draw_call_table and the call details show these entries.
+        skipped: _,             // calls_block shows the number of unreadable records.
+        limited: _,             // calls_block and draw_activity show this limit.
+        errors: _,              // draw_errors
+        refresh_seconds: _,     // App::refresh_due
         // draw_session_table lists the inventory or shows the error that stopped reading it,
         // and session_lines shows the selected session.
         session_inventory: _,
@@ -3014,7 +3093,7 @@ fn period_lines(app: &App, period: Period, baseline: bool) -> Vec<Line<'static>>
         _ => &app.data.metrics.week,
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled(count(counts.requests), Modifier::BOLD),
+        Span::styled(grouped(counts.requests), Modifier::BOLD),
         Span::styled(" calls · ", theme.muted),
         Span::styled(tokens(counts.tokens), Modifier::BOLD),
         Span::styled(" tokens", theme.muted),
@@ -3036,7 +3115,7 @@ fn draw_activity(frame: &mut Frame, app: &App, area: Rect) {
     let data = &app.data.activity;
     let peak = data.iter().copied().max().unwrap_or_default();
     let mut outer = block(theme, "Calls per hour · past 24h")
-        .title_top(Line::styled(format!(" peak {} ", count(peak)), theme.muted).right_aligned())
+        .title_top(Line::styled(format!(" peak {} ", grouped(peak)), theme.muted).right_aligned())
         .title_bottom(Line::styled(" 24h ago ", theme.muted))
         .title_bottom(Line::styled(" now ", theme.muted).right_aligned());
     if app.data.limited {
@@ -3100,7 +3179,7 @@ fn model_row(
         )));
     }
     cells.extend([
-        right(count(usage.requests)),
+        right(grouped(usage.requests)),
         right(tokens(usage.total())),
         right(cost(theme, usage.cost.total_usd, usage.cost.known_usd)),
         Cell::from(Line::from(vec![
@@ -3222,7 +3301,7 @@ fn calls_block(app: &App) -> Block<'static> {
     let mut title = vec![
         Span::styled(" Calls ", Modifier::BOLD),
         Span::styled(
-            format!("[{}] ", count(app.visible.len() as u64)),
+            format!("[{}] ", grouped(app.visible.len() as u64)),
             theme.muted,
         ),
     ];
@@ -3251,7 +3330,7 @@ fn calls_block(app: &App) -> Block<'static> {
                 format!(
                     " {} of {} ",
                     app.selected + 1,
-                    count(app.visible.len() as u64)
+                    grouped(app.visible.len() as u64)
                 ),
                 theme.muted,
             )
@@ -3411,8 +3490,8 @@ fn detail_lines(theme: Theme, entry: &Entry) -> Vec<Line<'static>> {
             "Input",
             format!(
                 "{} uncached · {} cached",
-                count(usage.input),
-                count(usage.cached_input)
+                grouped(usage.input),
+                grouped(usage.cached_input)
             ),
         ),
     ];
@@ -3421,12 +3500,12 @@ fn detail_lines(theme: Theme, entry: &Entry) -> Vec<Line<'static>> {
             "Cache",
             format!(
                 "{} written ({} at the 1-hour rate)",
-                count(usage.cache_write),
-                count(usage.cache_write_1h)
+                grouped(usage.cache_write),
+                grouped(usage.cache_write_1h)
             ),
         ));
     }
-    lines.push(field("Output", count(usage.output)));
+    lines.push(field("Output", grouped(usage.output)));
     lines.push(match entry.cost {
         Some(RecordedCost { usd, source }) => field(
             "Cost",
@@ -3455,7 +3534,7 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     }
     let totals = app.period.totals(&app.data.analytics);
     let mut summary = vec![
-        Span::styled(count(totals.requests()), Modifier::BOLD),
+        Span::styled(grouped(totals.requests()), Modifier::BOLD),
         Span::styled(" answer calls · ", theme.muted),
         Span::styled(tokens(totals.tokens()), Modifier::BOLD),
         Span::styled(" tokens", theme.muted),
@@ -3542,7 +3621,7 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
                     }
                     .to_string(),
                 ),
-                right(count(usage.requests)),
+                right(grouped(usage.requests)),
                 right(tokens(usage.total())),
                 right(cost(theme, usage.cost.total_usd, usage.cost.known_usd)),
             ])
@@ -3629,7 +3708,7 @@ fn draw_route_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     let mut title = vec![
         Span::styled(" Routes ", Modifier::BOLD),
-        Span::styled(format!("[{}] ", count(visible as u64)), theme.muted),
+        Span::styled(format!("[{}] ", grouped(visible as u64)), theme.muted),
     ];
     if !app.route_filter.is_empty() || app.filtering {
         title.push(Span::styled(format!("/{} ", app.route_filter), theme.key));
@@ -3658,7 +3737,11 @@ fn draw_route_table(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     outer = outer.title_bottom(
         Line::styled(
-            format!(" {} of {} ", app.route_selected + 1, count(visible as u64)),
+            format!(
+                " {} of {} ",
+                app.route_selected + 1,
+                grouped(visible as u64)
+            ),
             theme.muted,
         )
         .right_aligned(),
@@ -3878,7 +3961,7 @@ fn draw_harness_table(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(tool.label),
                 Cell::from(state),
                 Cell::from(settings.join(" · ")),
-                right(count(tool.accounts.len() as u64)),
+                right(grouped(tool.accounts.len() as u64)),
             ];
             Row::new(
                 cells
@@ -4294,6 +4377,10 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let heading = |text: &'static str| Line::styled(text, theme.muted.bold());
     let (_, _, name, about, _) = rows(Tab::Settings).nth(app.action).unwrap_or(&ACTIONS[0]);
     let mut lines = vec![Line::from(*about), Line::default()];
+    if app.data.needs_setup {
+        lines.push(Line::from("Choose Change configuration to save setup. Existing config files skip setup on later installs."));
+    }
+
     if !app.data.errors.is_empty() {
         lines.extend(
             app.data
@@ -4719,7 +4806,8 @@ fn form_notes(app: &App, form: &Form) -> Vec<Line<'static>> {
             ),
             Line::default(),
         ],
-        FormKind::Preferences
+        FormKind::Configuration
+        | FormKind::Preferences
         | FormKind::Update(_)
         | FormKind::Confirm(..)
         | FormKind::Remove { .. } => Vec::new(),
