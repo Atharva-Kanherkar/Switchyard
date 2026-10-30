@@ -134,6 +134,114 @@ pub fn inventory() -> Result<Vec<serde_json::Value>, String> {
     Ok(sessions)
 }
 
+pub fn managed_session(id: &str) -> Result<serde_json::Value, String> {
+    let suffix = id.strip_prefix("sy-").ok_or("Choose a managed session.")?;
+    uuid::Uuid::parse_str(suffix).map_err(|_| "Choose a managed session.")?;
+    let root = session_root()?;
+    let private = root.join(format!("{id}-settings"));
+    let worktree = root.join(id);
+    for path in [&root, &private, &worktree] {
+        if std::fs::symlink_metadata(path)
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("Session directories must not be symlinks.".into());
+        }
+    }
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(private.join("session.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if receipt["id"] != id || receipt["worktree"] != worktree.display().to_string() {
+        return Err("The session receipt does not match this worktree.".into());
+    }
+    Ok(receipt)
+}
+
+pub fn cleanup_preview(id: &str) -> Result<serde_json::Value, String> {
+    let mut receipt = managed_session(id)?;
+    let worktree = receipt["worktree"]
+        .as_str()
+        .ok_or("Missing session worktree.")?
+        .to_string();
+    let run = |args: &[&str]| -> Result<String, String> {
+        let output = std::process::Command::new("git")
+            .args(["-C", &worktree])
+            .args(args)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    // Plain `git worktree remove` deletes ignored files, so the review lists them.
+    let status = run(&["status", "--porcelain", "--ignored=matching"])?;
+    receipt["dirty"] = serde_json::json!(status.lines().any(|line| !line.starts_with("!! ")));
+    receipt["ignored"] = serde_json::json!(
+        status
+            .lines()
+            .filter_map(|line| line.strip_prefix("!! "))
+            .collect::<Vec<_>>()
+    );
+    receipt["current_revision"] = serde_json::json!(run(&["rev-parse", "HEAD"])?);
+    receipt["current_branch"] = serde_json::json!(run(&["branch", "--show-current"])?);
+    receipt["cleanup_notice"] = serde_json::json!(
+        "Cleanup removes a clean worktree and its unchanged session branch. \
+         It also deletes the Git-ignored files in the worktree, which the ignored list names. \
+         Recorded usage stays in the routing log. Unknown private files are preserved."
+    );
+    Ok(receipt)
+}
+
+pub fn cleanup(id: &str, reviewed: &serde_json::Value) -> Result<String, String> {
+    let current = cleanup_preview(id)?;
+    if &current != reviewed {
+        return Err("The session changed since review. Review cleanup again.".into());
+    }
+    if current["dirty"] != false
+        || current["current_revision"] != current["revision"]
+        || current["current_branch"] != id
+    {
+        return Err("Save or move the session’s work before cleanup. \
+                    Cleanup requires a clean worktree with its original commit and branch."
+            .into());
+    }
+    let repository = current["repository"]
+        .as_str()
+        .ok_or("Missing session repository.")?;
+    let worktree = current["worktree"]
+        .as_str()
+        .ok_or("Missing session worktree.")?;
+    let revision = current["revision"]
+        .as_str()
+        .ok_or("Missing session commit.")?;
+    // Receipt path resolution must succeed before cleanup removes the worktree.
+    let private = session_root()?.join(format!("{id}-settings"));
+    let output = std::process::Command::new("git")
+        .args(["-C", repository, "worktree", "remove", worktree])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+
+    // The worktree is gone, so the receipt goes too; otherwise the inventory keeps the session.
+    // Cleanup removes only the receipt because settings can contain later user edits.
+    std::fs::remove_file(private.join("session.json")).map_err(|error| error.to_string())?;
+    let _ = std::fs::remove_dir(&private);
+    if !delete_session_branch(Path::new(repository), id, revision) {
+        return Ok(format!(
+            "Removed the clean session worktree. Git kept the branch {id}; \
+             inspect it before deleting it. Retained private settings and recorded usage."
+        ));
+    }
+    Ok("Removed the clean session worktree and branch. \
+        Retained private settings and recorded usage."
+        .into())
+}
+
 pub fn launch(
     tool: Harness,
     project: &Path,
@@ -366,4 +474,358 @@ pub fn launch(
          Remove the worktree with git worktree remove after saving or discarding its changes.",
         worktree.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_session_setup_removes_its_worktree_branch_and_private_settings() {
+        let dir = tempfile::tempdir().expect("directory");
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ]);
+        let worktree = dir.path().join("worktree");
+        let private = dir.path().join("settings");
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "session-fixture",
+            worktree.to_str().expect("path"),
+        ]);
+        std::fs::create_dir(&private).expect("private");
+        std::fs::write(private.join("settings.json"), "{}").expect("settings");
+        let revision = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        // An unrelated HEAD in the original checkout makes `branch -d` refuse the session branch.
+        git(&["checkout", "--orphan", "unrelated"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "unrelated",
+        ]);
+        drop(PendingSession {
+            project: project.clone(),
+            worktree: worktree.clone(),
+            private: private.clone(),
+            branch: "session-fixture".into(),
+            revision,
+            opened: false,
+        });
+        assert!(!worktree.exists());
+        assert!(!private.exists());
+        assert!(
+            !String::from_utf8_lossy(&git(&["branch", "--list", "session-fixture"]).stdout)
+                .contains("session-fixture")
+        );
+    }
+    // The subprocess isolates HOME and PATH.
+    // The Terminal stub injects a conflicting directory when the script must select one.
+    // Claude's default case requires an unset CLAUDE_CONFIG_DIR, not an explicit ~/.claude.
+    #[cfg(unix)]
+    #[test]
+    fn generated_sessions_use_explicit_accounts_without_changing_user_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(fixture) = std::env::var("SWITCHYARD_SESSION_FIXTURE") {
+            let fixture = std::path::PathBuf::from(fixture);
+            let tool = if std::env::var("SWITCHYARD_SESSION_TOOL").expect("tool") == "codex" {
+                Harness::CodexCli
+            } else {
+                Harness::Claude
+            };
+            let account =
+                std::env::var_os("SWITCHYARD_SESSION_ACCOUNT").map(std::path::PathBuf::from);
+            let revision = preview(&fixture.join("project")).expect("preview")["revision"]
+                .as_str()
+                .expect("revision")
+                .to_string();
+            // Advancing the original checkout makes a launch from HEAD differ from the review.
+            if tool == Harness::CodexCli && account.is_none() {
+                let committed = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(fixture.join("project"))
+                    .args([
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "advanced",
+                    ])
+                    .output()
+                    .expect("advance HEAD");
+                assert!(committed.status.success());
+            }
+            launch(
+                tool,
+                &fixture.join("project"),
+                "route'$(literal)",
+                "http://localhost:4123",
+                tool == Harness::Claude,
+                account.as_deref(),
+                &revision,
+            )
+            .expect("launch");
+            if tool == Harness::CodexCli && account.is_none() {
+                let records = inventory().expect("inventory");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0]["revision"], revision);
+                assert_ne!(
+                    preview(&fixture.join("project")).expect("advanced project")["revision"],
+                    revision
+                );
+                let id = records[0]["id"].as_str().expect("session id");
+                let receipt = session_root()
+                    .expect("session root")
+                    .join(format!("{id}-settings/session.json"));
+                let original = std::fs::read(&receipt).expect("receipt");
+                // Valid JSON roots must still be objects before inventory adds process_status.
+                for malformed in ["null", "[]", "false", "42"] {
+                    std::fs::write(&receipt, malformed).expect("malformed receipt");
+                    assert!(inventory().is_err());
+                    assert!(cleanup_preview(id).is_err());
+                }
+                std::fs::write(&receipt, original).expect("restore receipt");
+                let clean = cleanup_preview(id).expect("preview cleanup");
+                let worktree = Path::new(records[0]["worktree"].as_str().expect("worktree"));
+                let unsaved = worktree.join("unsaved-user-work.txt");
+                std::fs::write(&unsaved, "keep this work").expect("user work");
+                assert!(cleanup(id, &clean).is_err());
+                assert!(unsaved.exists());
+                let dirty = cleanup_preview(id).expect("dirty preview");
+                assert!(cleanup(id, &dirty).is_err());
+                assert!(worktree.exists());
+                std::fs::remove_file(&unsaved).expect("save fixture work");
+                let clean = cleanup_preview(id).expect("clean preview");
+                // Cleanup deletes ignored files, so a new ignored file requires a new review.
+                let info = fixture.join("project/.git/info");
+                std::fs::create_dir_all(&info).expect("git info");
+                std::fs::write(info.join("exclude"), "ignored-notes.txt\n").expect("exclude");
+                std::fs::write(worktree.join("ignored-notes.txt"), "notes").expect("notes");
+                assert!(cleanup(id, &clean).is_err());
+                assert!(worktree.join("ignored-notes.txt").exists());
+                let reviewed = cleanup_preview(id).expect("ignored preview");
+                assert_eq!(
+                    reviewed["ignored"],
+                    serde_json::json!(["ignored-notes.txt"])
+                );
+                // An unrelated HEAD in the original checkout makes `branch -d` refuse the branch.
+                let project_git = |args: &[&str]| {
+                    let output = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(fixture.join("project"))
+                        .args(args)
+                        .output()
+                        .expect("git");
+                    assert!(output.status.success());
+                    output
+                };
+                project_git(&["checkout", "--orphan", "unrelated"]);
+                project_git(&[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "unrelated",
+                ]);
+                cleanup(id, &reviewed).expect("safe cleanup");
+                assert!(!worktree.exists());
+                assert!(inventory().expect("inventory after cleanup").is_empty());
+                assert!(project_git(&["branch", "--list", id]).stdout.is_empty());
+            }
+            return;
+        }
+        for (name, named, inherited_dir) in [
+            ("codex", false, true),
+            ("codex", true, true),
+            ("claude", false, true),
+            ("claude", true, true),
+            ("claude", false, false),
+            ("claude", true, false),
+        ] {
+            let fixture = tempfile::tempdir().expect("fixture");
+            let home = fixture.path().join("home");
+            let bin = fixture.path().join("bin");
+            let project = fixture.path().join("project");
+            for path in [&home, &bin, &project] {
+                std::fs::create_dir(path).expect("directory");
+            }
+            for args in [
+                vec!["init"],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ],
+            ] {
+                assert!(
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&project)
+                        .args(args)
+                        .output()
+                        .expect("git")
+                        .status
+                        .success()
+                );
+            }
+            let default = home.join("default-login");
+            std::fs::create_dir(&default).expect("default");
+            std::fs::write(default.join("settings.json"), "{\"user\":true}").expect("settings");
+            let account = home.join(".switchyard/accounts").join(name).join("named");
+            if named {
+                std::fs::create_dir_all(&account).expect("account");
+            }
+            let output = fixture.path().join("arguments");
+            let captured = fixture.path().join("session.command");
+            // macOS runs the script through `open`; Linux runs it through the program in
+            // TERMINAL, which receives `-e` before the script path.
+            let open = bin.join(if cfg!(target_os = "linux") {
+                "terminal"
+            } else {
+                "open"
+            });
+            let terminal_claude = if inherited_dir || named {
+                "export CLAUDE_CONFIG_DIR=wrong-terminal-login"
+            } else {
+                "unset CLAUDE_CONFIG_DIR"
+            };
+            std::fs::write(
+                &open,
+                format!(
+                    "#!/bin/bash\n\
+                     [ \"$1\" = -e ] && shift\n\
+                     cp -- \"$1\" {}\n\
+                     export CODEX_HOME=wrong-terminal-login ANTHROPIC_AUTH_TOKEN=wrong-token\n\
+                     {terminal_claude}\n\
+                     bash \"$1\"\n",
+                    quote(&captured.display().to_string())
+                ),
+            )
+            .expect("open");
+            let tool = bin.join(name);
+            std::fs::write(
+                &tool,
+                format!(
+                    "#!/bin/bash\n\
+                     printf '%s\\n' \"${{CODEX_HOME:-}}\" \"${{CLAUDE_CONFIG_DIR:-}}\" \
+                     \"${{ANTHROPIC_AUTH_TOKEN:-}}\" \"$@\" > {0}.partial && mv {0}.partial {0}\n",
+                    quote(&output.display().to_string())
+                ),
+            )
+            .expect("tool");
+            for path in [&open, &tool] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                    .expect("executable");
+            }
+            let mut child = std::process::Command::new(std::env::current_exe().expect("runner"));
+            child
+                .args([
+                    "--exact",
+                    "sessions::tests::\
+                     generated_sessions_use_explicit_accounts_without_changing_user_defaults",
+                ])
+                .env("SWITCHYARD_SESSION_FIXTURE", fixture.path())
+                .env("SWITCHYARD_SESSION_TOOL", name)
+                .env("HOME", &home)
+                .env("CODEX_HOME", &default)
+                .env("CLAUDE_CONFIG_DIR", &default)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("TERMINAL", &open);
+            if named {
+                child.env("SWITCHYARD_SESSION_ACCOUNT", &account);
+            }
+            if !inherited_dir {
+                child.env_remove("CLAUDE_CONFIG_DIR");
+            }
+            let result = child.output().expect("child");
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            // A Linux terminal starts apart from the launch, so the arguments can arrive
+            // after the child exits. The tool stub renames the file into place when done.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !output.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let arguments = std::fs::read_to_string(output).expect("arguments");
+            let lines: Vec<_> = arguments.lines().collect();
+            let expected = if named {
+                account.to_str().expect("path")
+            } else if inherited_dir {
+                default.to_str().expect("path")
+            } else {
+                ""
+            };
+            assert_eq!(lines[usize::from(name == "claude")], expected);
+            if name == "claude" {
+                assert_eq!(lines[2], "");
+            }
+            assert!(arguments.contains("route'$(literal)"));
+            let script = std::fs::read_to_string(captured).expect("script");
+            assert!(script.contains("x-switchyard-session-id"));
+            if name == "claude" && !named && !inherited_dir {
+                assert!(!script.contains("export CLAUDE_CONFIG_DIR="));
+            }
+            assert_eq!(
+                std::fs::read_to_string(default.join("settings.json")).expect("settings"),
+                "{\"user\":true}"
+            );
+        }
+    }
 }
