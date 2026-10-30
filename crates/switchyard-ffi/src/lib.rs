@@ -97,6 +97,9 @@ enum CallReply {
     Error {
         error: String,
     },
+    Abort {
+        abort: String,
+    },
     Response {
         response: serde_json::Value,
         served_model: Option<ModelId>,
@@ -629,6 +632,7 @@ pub unsafe extern "C" fn sy_run_next(run: *const SyRun, out_json: *mut *mut c_ch
 }
 
 /// Delivers a buffered host reply to its pending call.
+/// An `abort` reply fails the run, even when the algorithm recovers from `error` replies.
 /// # Safety
 /// The run must remain live and JSON must be NUL-terminated. May overlap an async read.
 /// Do not call from a completion callback or Tokio task.
@@ -647,12 +651,17 @@ pub unsafe extern "C" fn sy_run_respond(
             .pending
             .remove(&call_id)
             .ok_or("unknown call ID")?;
+        let is_abort = matches!(reply, CallReply::Abort { .. });
         let result = match call {
             Call::Model(call) => {
                 let response = match reply {
                     CallReply::Error { error } => Ok(Err(LibsyError::external(
                         "host model call",
                         std::io::Error::other(error),
+                    ))),
+                    CallReply::Abort { abort } => Ok(Err(LibsyError::external(
+                        "host routing",
+                        std::io::Error::other(abort),
                     ))),
                     CallReply::Response {
                         response,
@@ -675,15 +684,23 @@ pub unsafe extern "C" fn sy_run_respond(
                         return Err(error.into());
                     }
                 };
-                run.engine
-                    .runtime
-                    .block_on(call.respond(std::future::ready(response)))
+                match response {
+                    Err(error) if is_abort => call.fail(error),
+                    response => run
+                        .engine
+                        .runtime
+                        .block_on(call.respond(std::future::ready(response))),
+                }
             }
             Call::Decision(call) => {
                 let response = match reply {
                     CallReply::Error { error } => Ok(Err(LibsyError::external(
                         "host decision call",
                         std::io::Error::other(error),
+                    ))),
+                    CallReply::Abort { abort } => Ok(Err(LibsyError::external(
+                        "host routing",
+                        std::io::Error::other(abort),
                     ))),
                     CallReply::Response { response, .. } => {
                         serde_json::from_value(response).map(Ok)
@@ -696,9 +713,13 @@ pub unsafe extern "C" fn sy_run_respond(
                         return Err(error.into());
                     }
                 };
-                run.engine
-                    .runtime
-                    .block_on(call.respond(std::future::ready(response)))
+                match response {
+                    Err(error) if is_abort => call.fail(error),
+                    response => run
+                        .engine
+                        .runtime
+                        .block_on(call.respond(std::future::ready(response))),
+                }
             }
         };
         if result.is_err() {
