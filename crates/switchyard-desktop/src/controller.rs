@@ -10,6 +10,7 @@ use crate::{
     harness::{self, Harness},
     history, models, pricing, rollup, server,
     server_config::{ALGORITHMS, Choice, Route, ServerConfig},
+    sessions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -101,6 +102,21 @@ pub enum Action {
         tool: Harness,
         name: String,
     },
+    Launch {
+        preview_token: Option<String>,
+        tool: Harness,
+        account: Option<String>,
+        route: String,
+        id: String,
+        project: String,
+    },
+    PreviewLaunch {
+        tool: Harness,
+        account: Option<String>,
+        route: String,
+        id: String,
+        project: String,
+    },
     LoginAccount {
         tool: Harness,
         name: String,
@@ -151,6 +167,12 @@ pub enum Action {
 #[derive(Clone, Default, Serialize)]
 pub struct Snapshot {
     pub update_status: Value,
+    /// Each value is the `session.json` file that `sessions::launch` wrote for a managed
+    /// worktree session, plus `process_status`. The snapshot passes these files through as JSON.
+    pub session_inventory: Vec<Value>,
+    /// This field holds the error that stopped the inventory read. `session_inventory` is empty
+    /// when this field is set.
+    pub session_inventory_error: Option<String>,
     pub settings: Option<AppSettings>,
     pub data_state: DataState,
     /// The controller increases this number when the app settings select another server
@@ -414,6 +436,17 @@ impl Review {
     }
 }
 
+// Each Controller retains one launch review until the next preview or a selected config change.
+// Review keeps raw settings private; Launch uses these values and the reviewed Git commit.
+struct ReviewedLaunch {
+    review: Review,
+    project: Value,
+    model: String,
+    server_url: String,
+    login: bool,
+    account: Option<PathBuf>,
+}
+
 pub struct Controller {
     health_probe: crate::health::Probe,
     settings: PathBuf,
@@ -423,9 +456,11 @@ pub struct Controller {
     generation: u64,
     route_reviews: std::collections::HashMap<String, Review>,
     tool_review: Option<Review>,
+
     account_archive: Option<(Harness, String, String)>,
     route_change: Option<Review>,
     update_review: Option<(String, Value)>,
+    launch_review: Option<ReviewedLaunch>,
 }
 impl Controller {
     pub fn new(config: Config, settings: PathBuf) -> Self {
@@ -437,9 +472,11 @@ impl Controller {
             generation: 0,
             route_reviews: Default::default(),
             tool_review: None,
+
             account_archive: None,
             route_change: None,
             update_review: None,
+            launch_review: None,
         }
     }
     fn reload(&mut self) -> Result<(), String> {
@@ -449,6 +486,7 @@ impl Controller {
             self.route_reviews.clear();
             self.tool_review = None;
             self.route_change = None;
+            self.launch_review = None;
         }
         self.config = config;
 
@@ -678,6 +716,10 @@ impl Controller {
                 }
             })
             .collect();
+        let (session_inventory, session_inventory_error) = match sessions::inventory() {
+            Ok(inventory) => (inventory, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         let Config {
             server_url,
             routing_log,
@@ -703,6 +745,8 @@ impl Controller {
                 baseline_model: baseline_model.clone(),
                 prices_file,
             }),
+            session_inventory,
+            session_inventory_error,
             data_state: DataState {
                 usage: Source {
                     state: usage_state,
@@ -770,9 +814,10 @@ impl Controller {
             }
             Action::OpenUpdateLog {} => self.update_log().map(Some),
             Action::OpenLogs {} => logs_dir().map(Some),
-            // An account folder opens in the editor too, because a terminal may run over SSH,
-            // where `open` would start a file manager on another screen.
+            // Account and session folders open in the editor too, because a terminal may run
+            // over SSH, where `open` would start a file manager on another screen.
             Action::OpenAccount { tool, name } => account_path(*tool, Some(name)),
+
             _ => Ok(None),
         }
     }
@@ -1106,6 +1151,104 @@ impl Controller {
             }
             Action::AddAccount { tool, name } => {
                 accounts::add(tool, name.trim()).map(Reply::message)
+            }
+            Action::Launch {
+                tool,
+                account,
+                route,
+                id,
+                project,
+                preview_token,
+            } => {
+                let inputs =
+                    json!({"tool":tool,"account":account,"route":route,"id":id,"project":project});
+                // Each attempt uses up the review, so a repeated request cannot create a second
+                // worktree and terminal from one review.
+                let plan = self
+                    .launch_review
+                    .take()
+                    .ok_or("Review the session before opening Terminal.")?;
+                plan.review.check(preview_token.as_deref(), &inputs)?;
+                let current = sessions::preview(std::path::Path::new(&project))?;
+                if current != plan.project {
+                    return Err(
+                        "The project changed since review. Review the session again.".into(),
+                    );
+                }
+                sessions::launch(
+                    tool,
+                    std::path::Path::new(
+                        plan.project["project"]
+                            .as_str()
+                            .ok_or("Missing reviewed project.")?,
+                    ),
+                    &plan.model,
+                    &plan.server_url,
+                    plan.login,
+                    plan.account.as_deref(),
+                    plan.project["revision"]
+                        .as_str()
+                        .ok_or("Missing reviewed commit.")?,
+                )
+                .map(Reply::message)
+            }
+            Action::PreviewLaunch {
+                tool,
+                account,
+                route,
+                id,
+                project,
+            } => {
+                if tool == Harness::CodexApp {
+                    return Err("Use Codex app’s workspace controls or choose Codex CLI.".into());
+                }
+                if harness::binary(tool).is_none() {
+                    return Err("Install the selected harness first.".into());
+                }
+                let inputs =
+                    json!({"tool":tool,"account":account,"route":route,"id":id,"project":project});
+                let review = Review::capture(
+                    inputs.clone(),
+                    vec![self.config.config_file.clone(), self.settings.clone()],
+                )?;
+                let app_config = Config::load(&self.settings)?;
+                review.check(Some(&review.token), &inputs)?;
+                if app_config.config_file != self.config.config_file {
+                    return Err("Review these changes again before applying them.".into());
+                }
+                let config = ServerConfig::parse(review.original()?).map_err(
+                    |_| "The server config contains invalid TOML. Open it in Settings to fix it.",
+                )?;
+                let route = current_route(&config, &route, Some(&id))?;
+                let login = login_mode(tool, &config, &route.key)?;
+                let account = account_path(tool, account.as_deref())?;
+                let project_review = sessions::preview(std::path::Path::new(&project))?;
+                let mut data = project_review.clone();
+                data["tool"] = json!(tool);
+                data["route"] = json!(route.id);
+                data["account_directory"] = json!(account);
+                data["server_url"] = json!(app_config.server_url);
+                data["login"] = json!(login);
+                if tool == Harness::Pi {
+                    data["settings_notice"] = json!(
+                        "Pi uses isolated session settings. \
+                         Personal settings and extensions are not copied."
+                    );
+                }
+                review.check(Some(&review.token), &inputs)?;
+                data["preview_token"] = json!(review.token);
+                self.launch_review = Some(ReviewedLaunch {
+                    review,
+                    project: project_review,
+                    model: route.id,
+                    server_url: app_config.server_url,
+                    login,
+                    account,
+                });
+                Ok(Reply {
+                    message: String::new(),
+                    data,
+                })
             }
             Action::LoginAccount { tool, name } => {
                 let path = account_path(tool, Some(&name))?.ok_or("Choose an account.")?;
@@ -1678,6 +1821,133 @@ policy = { type = "target_selector", selector = "/target" }
             format!("{text}# external edit\n")
         );
         assert_eq!(std::fs::read_dir(dir.path()).expect("files").count(), 2);
+    }
+
+    #[test]
+    // A custom destination must use the same files for preview, installation, backup, and restore.
+    fn custom_settings_are_validated_and_restored() {
+        let dir = tempfile::tempdir().expect("directory");
+        for (tool, _) in harness::HARNESSES {
+            let file = dir.path().join(if *tool == Harness::Pi {
+                "models.json"
+            } else {
+                "custom-settings"
+            });
+            assert_eq!(
+                install_paths(*tool, None, Some(file.to_str().expect("path"))).expect("custom")[0],
+                file
+            );
+        }
+        for (account, file) in [
+            (None, "relative.json"),
+            (None, ""),
+            (Some("account"), "/tmp/settings.json"),
+            (None, "/tmp/settings\n.json"),
+        ] {
+            assert!(install_paths(Harness::Claude, account, Some(file)).is_err());
+        }
+        assert!(install_paths(Harness::Pi, None, Some("/tmp/settings.json")).is_err());
+        assert!(install_paths(Harness::Claude, None, dir.path().to_str()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).expect("files").count(), 0);
+        let settings = dir.path().join("app.toml");
+        let config = dir.path().join("server.toml");
+        std::fs::write(
+            &config,
+            "[llm_clients.c]\n\
+             base_url='https://example.com/v1'\n\
+             format='openai_chat'\n\
+             [targets.m]\n\
+             id='actual'\n\
+             llm_client='c'\n\
+             [routes.r]\n\
+             id='public'\n\
+             type='passthrough'\n\
+             target='m'\n",
+        )
+        .expect("config");
+        std::fs::write(
+            &settings,
+            format!(
+                "config_file={config:?}\nrouting_log={:?}",
+                dir.path().join("log")
+            ),
+        )
+        .expect("settings");
+        let custom = dir.path().join("custom.json");
+        std::fs::write(&custom, "{\"user\":true}").expect("custom");
+        let mut controller = Controller::new(Config::load(&settings).expect("settings"), settings);
+        let file = Some(custom.display().to_string());
+        let preview = controller
+            .dispatch(Action::PreviewInstall {
+                tool: Harness::Claude,
+                account: None,
+                settings_file: file.clone(),
+                route: "r".into(),
+                id: "public".into(),
+            })
+            .expect("preview");
+        assert!(
+            preview.data["changes"]
+                .as_array()
+                .expect("diff")
+                .iter()
+                .any(|change| change["file"] == custom.display().to_string())
+        );
+        std::fs::write(&custom, "{\"external\":true}").expect("external edit");
+        let rejected = controller.dispatch(Action::Install {
+            tool: Harness::Claude,
+            account: None,
+            settings_file: file.clone(),
+            route: "r".into(),
+            id: "public".into(),
+            preview_token: preview.data["preview_token"].as_str().map(str::to_string),
+        });
+        assert!(rejected.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&custom).expect("custom"),
+            "{\"external\":true}"
+        );
+        assert!(
+            !custom
+                .with_file_name("custom.json.switchyard-original")
+                .exists()
+        );
+        std::fs::write(&custom, "{\"user\":true}").expect("restore fixture");
+        controller
+            .dispatch(Action::Install {
+                tool: Harness::Claude,
+                account: None,
+                settings_file: file.clone(),
+                route: "r".into(),
+                id: "public".into(),
+                preview_token: preview.data["preview_token"].as_str().map(str::to_string),
+            })
+            .expect("install");
+        assert_eq!(
+            preview.data["proposed"],
+            harness::inspect(Harness::Claude, std::slice::from_ref(&custom)).expect("inspect")
+        );
+        let restore_preview = controller
+            .dispatch(Action::PreviewRestore {
+                tool: Harness::Claude,
+                account: None,
+                settings_file: file.clone(),
+            })
+            .expect("restore preview");
+        controller
+            .dispatch(Action::Restore {
+                tool: Harness::Claude,
+                account: None,
+                settings_file: file,
+                preview_token: restore_preview.data["preview_token"]
+                    .as_str()
+                    .map(str::to_string),
+            })
+            .expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(custom).expect("custom"),
+            "{\"user\":true}"
+        );
     }
 
     #[cfg(any(target_os = "macos", windows))]
