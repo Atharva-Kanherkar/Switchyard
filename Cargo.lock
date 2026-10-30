@@ -2668,6 +2668,7 @@ dependencies = [
  "switchyard-protocol",
  "switchyard-runner",
  "switchyard-server",
+ "switchyard-translation",
  "tokio",
 ]
 
