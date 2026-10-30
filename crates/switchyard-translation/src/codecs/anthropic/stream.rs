@@ -242,7 +242,7 @@ fn encode_anthropic_stream(
             // An in-band error is terminal: emit the error, then nothing further.
             state.finished = true; // finish() adds no success events
             state.errored = true; // the entry guard drops any later chunk
-            vec![json!({"type": "error", "error": {"message": message}})]
+            vec![json!({"type": "error", "error": {"type": "api_error", "message": message}})]
         }
     }
 }
@@ -628,6 +628,20 @@ fn capture_anthropic_usage(state: &mut StreamTranslationState, usage: &Value) {
     if let Some(value) = usage.get("input_tokens").and_then(Value::as_u64) {
         state.usage.input_tokens = Some(value);
     }
+    if let Some(cost) = crate::codecs::common::provider_cost(usage) {
+        state.usage.provider_cost = Some(cost);
+    }
+    if let Some(tokens) = usage
+        .get("cache_creation")
+        .and_then(|details| details.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_u64)
+    {
+        state
+            .usage
+            .cache
+            .get_or_insert_with(Default::default)
+            .cache_creation_1h_input_tokens = Some(tokens);
+    }
     if let Some(value) = usage.get("output_tokens").and_then(Value::as_u64) {
         state.usage.output_tokens = Some(value);
     }
@@ -676,7 +690,7 @@ fn anthropic_stream_usage(state: &StreamTranslationState) -> Value {
             json!({"thinking_tokens": value}),
         );
     }
-    Value::Object(usage)
+    crate::codecs::common::encode_usage_metadata(Value::Object(usage), &state.usage)
 }
 
 // Converts any upstream message ID into an Anthropic-looking message ID.

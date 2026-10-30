@@ -4,8 +4,8 @@ Setup, testing, project layout, and contribution conventions for hacking on
 Switchyard itself. If you only want to **use** the package, see
 [README](README.md).
 
-For deeper architectural docs, see [Agents](AGENTS.md) and
-[Architecture](docs/architecture.md).
+For crate boundaries and repository conventions, see [Agents](AGENTS.md).
+[Mechanics of Libsy](docs/mechanics_of_libsy.md) explains the execution model.
 
 ## Setup
 
@@ -51,6 +51,9 @@ pyproject.toml                    # Python package and development tooling
 ```bash
 uv sync
 source .venv/bin/activate
+
+# Build the Python extension
+uv run maturin develop
 
 # Run unit tests
 uv run pytest tests/ -v

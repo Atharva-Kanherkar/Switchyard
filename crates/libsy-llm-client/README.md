@@ -47,8 +47,10 @@ Within this workspace:
 
 ```toml
 [dependencies]
+futures-util = "0.3"
+switchyard-libsy = { path = "../libsy" }
 switchyard-llm-client = { path = "../libsy-llm-client" }
-switchyard-protocol = { path = "../libsy-protocol" }
+switchyard-protocol = { path = "../protocol" }
 switchyard-translation = { path = "../switchyard-translation" }   # for WireFormat
 ```
 
@@ -71,6 +73,7 @@ fn build_client() -> switchyard_llm_client::Result<TranslatingLlmClient> {
         extra_body: BTreeMap::new(),
         reasoning_effort: None,
         max_retries: 2,
+        failure_cooldown: std::time::Duration::from_secs(5),
         timeout: None,
     };
 
@@ -151,9 +154,15 @@ async fn stream(
 runs. The terminal outcome either already contains the answer or supplies the selected model and
 ordered fallbacks for the client to try. `ClientRouter::single` is the single-provider case:
 
+Routing-time calls run concurrently. If an algorithm drops one of its waiting
+call futures, the corresponding HTTP work is dropped while other calls continue.
+Ending or dropping the run drops all outstanding call handlers. A returned
+response stream stays alive until its consumer finishes or drops it. These are
+local cancellation guarantees; a provider may continue generation after disconnect.
+
 ```rust
 use std::sync::Arc;
-use switchyard_libsy::Algorithm;
+use switchyard_libsy::{Algorithm, RuntimeModels};
 use switchyard_llm_client::{ClientRouter, TranslatingLlmClient};
 use switchyard_protocol::Request;
 
@@ -161,10 +170,11 @@ async fn route(
     algorithm: Arc<dyn Algorithm>,
     client: Arc<TranslatingLlmClient>,
     request: Request,
+    models: Arc<RuntimeModels>,
 ) -> switchyard_libsy::Result<String> {
     let clients = ClientRouter::single(client);
     let (selected_model, _response) =
-        switchyard_llm_client::run(algorithm, clients, request, None).await?;
+        switchyard_llm_client::run(algorithm, clients, request, models, None).await?;
     Ok(selected_model.to_string())
 }
 ```
@@ -238,17 +248,47 @@ fn build_multi_format_client(
   normalize `authorization`, `chatgpt-account-id`, and `x-openai-fedramp`.
   Anthropic backends forward `authorization` or `x-api-key`; they also keep
   `oauth-*` values from `anthropic-beta` and remove other caller-supplied beta values.
-  All backends reachable through a forwarding route must use the same provider.
+  The forwarding backends in one route must use one credential family (OpenAI or
+  Anthropic) unless they all use the same scheme, host, and port, such as one LLM
+  gateway that accepts the caller's gateway key on every endpoint. Such a route
+  serves Chat Completions and Responses callers and forwards their bearer token
+  to every forwarding backend. Backends that send a configured key are not restricted.
   Headers owned by other providers are preserved as application headers.
 - Per-backend custom headers go in `HttpBackendConfig::extra_headers`. Set credentials with
   `api_key`. OpenAI backends reject `Authorization`; Anthropic backends reject `x-api-key`
   and `anthropic-version`. Header names are case-insensitive.
 - Per-target top-level request defaults go in `HttpBackendConfig::extra_body`.
   The merge is shallow and fields already present in the request take precedence.
+- Anthropic reconstruction preserves the caller's native `thinking` settings, including
+  disabled thinking and manual budgets. `output_config.effort` is kept separately.
+  Effort implies adaptive thinking only when native `thinking` is absent.
+  To replace either top-level field for a target, list it in `omit_body_fields` and
+  supply its replacement in `extra_body`. Omission runs before defaults are merged.
+  Target `reasoning_effort` overrides apply to OpenAI backends.
 - `HttpBackendConfig::max_retries` controls additional attempts after retryable
   transport failures, timeouts, HTTP 408/429, and 5xx responses. Buffered body
   transport failures are retried; streaming body failures are not replayed after
   the response has been returned.
+- If an OpenAI Chat backend explicitly rejects `chat_template_kwargs =
+  {"enable_thinking": false}` with HTTP 400 or 422, the client retries once without
+  that field. This compatibility retry is separate from `max_retries` and shares
+  the original timeout. `omit_body_fields` can remove it from the first attempt.
+- Codex endpoints whose URL path ends in `/backend-api/codex/responses` receive
+  string `input` as a message-item list, including preserved requests. Other
+  fields, array input, non-Codex endpoints, and the translation codec's exact
+  preservation remain unchanged.
+- `ModelConfig::with_responses_reasoning` controls Responses reasoning replay.
+  Every Responses model defaults to `PreserveEncrypted`: plaintext is removed,
+  encrypted provider state is retained. Stored reasoning IDs are retained unless
+  the request sets `store: false`. Switchyard's translated Anthropic reasoning is
+  removed. Set `Drop` for
+  a backend that cannot consume provider reasoning. Messages and tool history are retained.
+- `HttpBackendConfig::failure_cooldown` skips completion calls to a backend briefly
+  after an exhausted transient failure. Zero disables it. State is shared per model
+  within the client. Calls resume when the cooldown expires. Deployment TOML defaults
+  `failure_cooldown_ms` to `5000` (5 seconds); set it to `0` to disable cooldown.
+  With `forward_auth`, HTTP 429 keeps its request-local retries and fallback while
+  leaving shared cooldown state unchanged.
 - `HttpBackendConfig::timeout` bounds one complete response, including retries,
   retry delays, and every stream read. Expiry returns `LlmClientError::Timeout`,
   either from the call or from the returned stream, which then ends. `None` leaves
@@ -257,12 +297,15 @@ fn build_multi_format_client(
 `run` and `decide` collect streams used during routing, including answers that an
 algorithm must inspect, before returning them to the algorithm. They retain the
 provider events for replay. After the configured retries, a client failure stops
-`run` or `decide` before the algorithm can choose another routing candidate. This
-also applies when `timeout` is `None` or an advisor has `fail_open = true`.
-`libsy` and custom hosts that drive it directly are unchanged.
+`run` or `decide` by default. Calls with `CallModel::recover_errors` enabled return
+the error to the algorithm so it can apply its fallback policy. Capability
+classifiers and advisor consults default to `fail_open = true`. Set `fail_open = false`
+to stop the request on their client failures. Recovery includes client errors and
+deadlines during stream collection. Custom hosts can honor the same flag when serving calls.
 
 Retries replay the same upstream request to the same model. After routing completes,
-non-timeout failures may try another completion candidate. A timeout stops the call.
+non-timeout failures may try another completion candidate. A timeout stops the call;
+a connection that times out before it is established is a `Transport` failure.
 A transport failure can duplicate a request that the provider processed but did not
 finish returning. Each attempt is counted once; expiry during a retry delay or
 after a stream has started does not count another attempt.
@@ -279,14 +322,14 @@ after a stream has started does not count another attempt.
 | `RequestEncoding(msg)` | re-encoding an already-decoded request to the wire format failed (internal fault) |
 | `ResponseTranslation(msg)` | response decoding or encoding failed in the translation engine |
 | `Timeout { source }` | request or response body read exceeded its timeout |
-| `Transport { source }` | non-timeout connection or transport failure |
+| `Transport { source }` | connection failure, including a connect timeout, or another transport failure |
 | `ContextWindowExceeded { model, message }` | upstream 400 detected as a context overflow (checked before `UpstreamHttp`, so callers can evict-and-retry) |
 | `UpstreamHttp { status, body }` | any other non-2xx upstream response |
 | `InvalidResponse { source }` | the upstream response could not be decoded |
 | `Other(source)` | a client-specific failure outside the shared categories |
 
-[`switchyard_protocol::Request`]: ../libsy-protocol
-[`switchyard_protocol::Response`]: ../libsy-protocol
+[`switchyard_protocol::Request`]: ../protocol
+[`switchyard_protocol::Response`]: ../protocol
 [`libsy-proxy`]: ../libsy-proxy
 [`Backend`]: src/backend.rs
 [`HttpBackendConfig`]: src/backend.rs
