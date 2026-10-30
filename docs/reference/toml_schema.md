@@ -426,6 +426,8 @@ the signals work and for tuning.
 | `picker` | Yes | — | `efficient_first`, or `capable_first` (experimental, unbenchmarked). Tier used when the signals are not confident. |
 | `confidence_threshold` | Yes | — | Corroboration a decisive pick needs. In `[0, 1]`. `efficient_first_threshold` is accepted as an alias. |
 | `capable_first_threshold` | No | `0.0` | Threshold used after an outer classifier selects the capable tier. Only a [composite](#composite) route sets that tier, so this key has no effect on a standalone `stage_router` route. |
+| `capable_system_prompt` | No | unset | System prompt prepended for capable requests. |
+| `efficient_system_prompt` | No | unset | System prompt prepended for efficient requests. |
 | `recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
 | `capable_hold_turns` | No | `2` | Requests kept on capable after a switch. Signal-driven capable decisions also start finite holds. Active holds skip signal processing and classification; `0` disables; `-1` pins after a switch. |
 | `efficient_hold_turns` | No | `0` | Requests kept on efficient after a switch, even when errors appear. `0` disables; `-1` pins after a switch. |
@@ -544,6 +546,9 @@ confidence threshold. Tool signals still drive escalation and recovery. See
 | `stage.tool_semantics.new` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as neutral forward activity. |
 | `stage.handoff_notes` | No | unset | Optional guidance appended to forwarded requests. Uses the same fields and behavior as [stage-router handoff notes](../routing_algorithms/stage_router_routing.md#optional-handoff-notes). |
 | `subagents` | No | unset | Nested policy used only for delegated sub-agent work. |
+
+Optional `efficient` and `capable` tables provide independent stage
+settings and prompts. See [independent stage profiles](../routing_algorithms/composite_routing.md#independent-stage-profiles).
 
 For decision classifier configuration, see
 [Decision model classifier](../routing_algorithms/composite_routing.md#decision-model-classifier).

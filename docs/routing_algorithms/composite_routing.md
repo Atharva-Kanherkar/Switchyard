@@ -8,9 +8,9 @@ fit the same route type.
 ## What exists today
 
 One pairing: a classifier selects the stage router's starting policy.
-An efficient classification selects efficient-first with `efficient_first_threshold`
+By default, an efficient classification selects efficient-first with `efficient_first_threshold`
 (default `0.5`).
-A capable classification selects capable-first with `capable_first_threshold`
+A capable classification defaults to capable-first with `capable_first_threshold`
 (default `0.0`). Both thresholds are configurable from `0.0` to `1.0`.
 Tool signals can still change the tier
 during execution. Both algorithms and the
@@ -63,6 +63,41 @@ nor a second `classifier`. The outer classifier supplies the default tier.
 `confidence_threshold` remains an alias for `efficient_first_threshold`.
 Custom `tool_semantics` remain stage-local and have the same additive behavior as
 on a standalone stage route.
+
+### Independent stage profiles
+
+Add these tables beside `stage` to configure each profile over the shared target pair:
+
+```toml
+[routes.switchyard.efficient]
+picker = "efficient_first"
+confidence_threshold = 0.5
+efficient_hold_turns = 0
+capable_system_prompt = "Resolve the difficult step."
+efficient_system_prompt = "Carry out the next concrete step."
+
+[routes.switchyard.capable]
+picker = "capable_first"
+confidence_threshold = 0.2
+efficient_hold_turns = -1
+capable_system_prompt = "Plan the work and resolve uncertain steps."
+efficient_system_prompt = "Continue implementing the plan."
+```
+
+Both profiles use the [stage tuning and prompt settings](stage_router_routing.md#knob-reference).
+The judge's verdict selects `efficient` or `capable`. Their pickers default to
+efficient-first and capable-first respectively. Override `picker` to use either
+mode in either profile, including capable-first in both.
+Targets stay in `stage` and the profile selector stays in `classifier`.
+Each profile can also define its own `classifier` table, using the standalone
+stage classifier settings and target. It runs only when stage signals abstain.
+On model fallback, each candidate receives the active profile's prompt for its tier.
+Omitted settings inherit from `stage`, including the corresponding threshold.
+A supplied `tool_semantics` or `handoff_notes` table replaces the shared table.
+
+Either table enables two profiles with separate hold state. Switching back
+resumes that profile's holds. Inactive profiles do not consume hold turns.
+With neither table, existing behavior is preserved.
 
 ## Custom LLM classifier
 

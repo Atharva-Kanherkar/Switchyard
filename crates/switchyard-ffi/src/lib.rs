@@ -127,6 +127,7 @@ enum RunStep<'a> {
         selected_model_ids: &'a [ModelId],
         request: &'a LlmRequest,
         fallback_request: Option<&'a LlmRequest>,
+        candidate_requests: HashMap<&'a ModelId, &'a LlmRequest>,
         response: Option<&'a AggLlmResponse>,
         metadata: Option<OutcomeMetadataRef<'a>>,
     },
@@ -303,6 +304,11 @@ impl RunState {
                         .fallback_request
                         .as_ref()
                         .map(|request| &request.llm_request),
+                    candidate_requests: outcome
+                        .candidate_requests
+                        .iter()
+                        .map(|(id, request)| (id, &request.llm_request))
+                        .collect(),
                     response: response.as_ref(),
                     metadata: outcome
                         .metadata

@@ -330,9 +330,13 @@ impl DeploymentConfig {
     ) -> impl Iterator<Item = RunnerResult<(&str, &RouteConfig, AlgorithmAndModels)>> {
         let targets = self.build_targets();
         self.routes.iter().map(move |(route_name, config)| {
-            let decision_judge = config.algorithm.decision_judge();
-            for name in config.callable_target_names() {
-                let (exists, kind) = if decision_judge.is_some_and(|(judge, _)| judge == name) {
+            let classifiers: Vec<_> = config.algorithm.classifier_targets().collect();
+            for (name, decision) in classifiers.iter().copied().chain(
+                config.callable_target_names().into_iter()
+                    .filter(|name| !classifiers.iter().any(|(judge, _)| judge == name))
+                    .map(|name| (name, None)),
+            ) {
+                let (exists, kind) = if decision.is_some() {
                     (self.decision_targets.contains_key(name), "decision")
                 } else {
                     (self.targets.contains_key(name), "LLM")
@@ -344,9 +348,10 @@ impl DeploymentConfig {
                 }
             }
             for name in config.routing_target_names().into_iter().chain(
-                decision_judge
+                classifiers
                     .into_iter()
-                    .flat_map(|(_, judge)| judge.candidates.values().map(String::as_str)),
+                    .filter_map(|(_, decision)| decision)
+                    .flat_map(|judge| judge.candidates.values().map(String::as_str)),
             ) {
                 if !self.targets.contains_key(name) {
                     return Err(RunnerError::configuration(format!(
@@ -618,8 +623,8 @@ impl DeploymentConfig {
         for name in route.callable_target_names() {
             if route
                 .algorithm
-                .decision_judge()
-                .is_some_and(|(judge, _)| judge == name)
+                .classifier_targets()
+                .any(|(judge, decision)| judge == name && decision.is_some())
             {
                 let target = &self.decision_targets[name];
                 decisions_by_model.insert(
@@ -1481,10 +1486,14 @@ new = ["send_message"]
 
     #[test]
     fn stage_and_composite_validate_hold_turns() {
+        let composite =
+            composite_config().replace("capable_hold_turns = 2", "capable_hold_turns = 0");
         for source in [
             stage_config(),
             stage_config().replace("efficient_first", "capable_first"),
             composite_config(),
+            format!("{composite}\n[routes.composed.efficient]\ncapable_hold_turns = 2"),
+            format!("{composite}\n[routes.composed.capable]\ncapable_hold_turns = 2"),
         ] {
             for field in ["capable_hold_turns", "efficient_hold_turns"] {
                 for (turns, valid) in [
@@ -1531,7 +1540,7 @@ evidence = { description = "candidate comparison" }
         ] {
             let deployment: DeploymentConfig = toml::from_str(&source).unwrap();
             let spec = &deployment.routes["composed"].algorithm;
-            assert_eq!(spec.decision_judge().unwrap().0, "tier_judge");
+            assert_eq!(spec.classifier_targets().next().unwrap().0, "tier_judge");
             assert_eq!(
                 spec.build_with_runtime_models("composed", &deployment.build_targets())
                     .is_ok(),
