@@ -18,7 +18,7 @@ pub use decision::DecisionJudgeConfig;
 use super::escalation;
 use super::fall_through::FallThrough;
 use super::util::DEFAULT_JUDGE_MAX_OUTPUT_TOKENS;
-use super::util::affinity::{AffinityRouter, ClassifyTrigger};
+use super::util::affinity::{AffinityRouter, ClassifyTrigger, is_user_turn};
 use super::util::classifier_contract::{
     ClassifierContract, ClassifierContractConfig, ClassifierResponseFormat,
 };
@@ -104,7 +104,7 @@ impl TaskClassifierVerdict {
 fn trim_messages(messages: &[Message], recent_turn_window: usize) -> Vec<Message> {
     let is_instruction = |message: &Message| matches!(message.role, Role::System | Role::Developer);
     let mut kept: Vec<&Message> = messages.iter().filter(|m| is_instruction(m)).collect();
-    let Some(task) = messages.iter().position(|m| m.role == Role::User) else {
+    let Some(task) = messages.iter().position(is_user_turn) else {
         return kept.into_iter().cloned().collect();
     };
     kept.push(&messages[task]);
@@ -169,9 +169,9 @@ fn task_messages(messages: &[Message]) -> Vec<Message> {
                 | ContentBlock::Reasoning { .. }
         )
     };
-    let mut user_messages = messages.iter().filter(|message| {
-        message.role == Role::User && message.content.iter().any(is_task_content)
-    });
+    let mut user_messages = messages
+        .iter()
+        .filter(|message| is_user_turn(message) && message.content.iter().any(is_task_content));
     let Some(opening_task) = user_messages.next() else {
         return Vec::new();
     };
@@ -1832,6 +1832,10 @@ mod tests {
             llm_request: LlmRequest {
                 messages: vec![
                     Message::text(Role::System, "client instructions"),
+                    Message::text(
+                        Role::User,
+                        "<environment_context>setup</environment_context>",
+                    ),
                     Message::text(Role::User, "initial task"),
                     Message::text(Role::Assistant, "old response"),
                     Message::text(Role::User, "old follow-up"),
@@ -1899,6 +1903,10 @@ mod tests {
 
     #[test]
     fn default_task_input_keeps_user_content_around_tool_results() {
+        let context = Message::text(
+            Role::User,
+            "<environment_context><current_date>2026-10-31</current_date></environment_context>",
+        );
         let mut result = tool_result("call-1");
         result.role = Role::User;
         let mut mixed = result.clone();
@@ -1911,11 +1919,13 @@ mod tests {
         let mut request = Request {
             llm_request: LlmRequest {
                 messages: vec![
+                    context.clone(),
                     result.clone(),
                     Message::text(Role::User, "initial task"),
                     tool_call("call-1"),
                     mixed,
                     result.clone(),
+                    context,
                 ],
                 ..LlmRequest::default()
             },
